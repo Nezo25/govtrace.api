@@ -1,0 +1,29 @@
+services:
+  db:
+    image: mysql:9.0
+    container_name: govtrace_db_container
+    restart: always
+    environment:
+      MYSQL_DATABASE: govtrace_db
+      MYSQL_ROOT_PASSWORD: En648213!
+    ports:
+      - "3307:3306"
+    volumes:
+      - govtrace_data:/var/lib/mysql
+    networks:
+      - govtrace-network
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - "8082:8080"
+    networks:
+      - govtrace-network
+
+networks:
+  govtrace-network:
+    driver: bridge
+
+volumes:
+  govtrace_data:
