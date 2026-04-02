@@ -1,118 +1,186 @@
 package tfs.com.govtrace.api.services;
 
+import com.fasterxml.jackson.core.json.JsonReadFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.beans.factory.annotation.Autowired;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
-import tfs.com.govtrace.api.controllers.PortalTransparenciaClient;
 import tfs.com.govtrace.api.models.Despesa;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
+@Slf4j
 @Service
 public class GeminiService {
 
-    @Autowired
-    private DespesaRepository repository;
-
-    @Autowired
-    private PortalTransparenciaClient portalClient;
-
+    private final DespesaRepository repository;
     private final RestTemplate restTemplate = new RestTemplate();
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final ObjectMapper mapper = new ObjectMapper()
+            .enable(JsonReadFeature.ALLOW_LEADING_ZEROS_FOR_NUMBERS.mappedFeature())
+            .enable(JsonReadFeature.ALLOW_UNQUOTED_FIELD_NAMES.mappedFeature())
+            .enable(JsonReadFeature.ALLOW_SINGLE_QUOTES.mappedFeature());
 
-    private final String GEMINI_KEY = "AIzaSyD0QT1srukZViQMz1CfrVIp7duiCTP7r-k";
-    private final String GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + GEMINI_KEY;
+    @Value("${govtrace.ai.gemini.api-key}")
+    private String geminiKey;
+
+    public GeminiService(DespesaRepository repository) {
+        this.repository = repository;
+    }
+
+    private String getGeminiUrl() {
+        return "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + geminiKey;
+    }
+
+    public String carregarBaseTransparencia() {
+        try {
+            log.info("[GovTrace] Sincronizando dados de Bragança Paulista via MCP...");
+            Map<String, Object> params = Map.of(
+                    "municipio", "Bragança Paulista",
+                    "ano", 2024,
+                    "mes", 1
+            );
+
+            String jsonResposta = consultarMcpBrasil("tce_sp", params);
+
+            if (jsonResposta == null || jsonResposta.isEmpty()) {
+                return "Erro: O MCP não retornou um JSON válido.";
+            }
+
+            JsonNode despesasNoPortal = mapper.readTree(jsonResposta);
+
+            if (despesasNoPortal.isArray()) {
+                for (JsonNode item : despesasNoPortal) {
+                    Despesa d = Despesa.builder()
+                            .nomeFavorecido(item.path("nm_fornecedor").asText("Desconhecido"))
+                            .cnpjFavorecido(item.path("nr_cnpj_cpf_fornecedor").asText("000.000.000-00"))
+                            .valorPago(item.path("vl_despesa").asText("0.00"))
+                            .dataPagamento(item.path("dt_emissao_despesa").asText("2024-01-01"))
+                            .documentoOrigem("MCP-" + item.path("nr_empenho").asText("SN"))
+                            .build();
+                    repository.save(d);
+                }
+                return "Sucesso: " + despesasNoPortal.size() + " registros importados.";
+            }
+            return "Nenhum dado encontrado.";
+        } catch (Exception e) {
+            log.error("[GovTrace] Erro na carga: {}", e.getMessage());
+            return "Erro técnico: " + e.getMessage();
+        }
+    }
 
     public String analisarBase() {
         List<Despesa> despesas = repository.findAll().stream()
                 .filter(d -> d.getVereditoIA() == null || d.getVereditoIA().isEmpty())
                 .toList();
 
-        if (despesas.isEmpty()) return "Nada para analisar agora.";
-        return executarAuditoria(despesas);
-    }
+        if (despesas.isEmpty()) return "Sem pendências.";
 
-    public String recuperarFalhas() {
-        List<Despesa> falhas = repository.findAll().stream()
-                .filter(d -> d.getVereditoIA() != null && d.getVereditoIA().contains("Erro na IA"))
-                .toList();
-
-        if (falhas.isEmpty()) return "Nenhuma falha para corrigir!";
-        return executarAuditoria(falhas);
-    }
-
-    private String executarAuditoria(List<Despesa> lista) {
-        for (Despesa d : lista) {
-            try {
-                String dadosItens = buscarItensReais(d.getDocumentoOrigem());
-                String dadosLicitacao = buscarParticipantesReais(d.getDocumentoOrigem());
-
-                String prompt = String.format(
-                        "Aja como auditor do TCU. Analise o risco de corrupção:\n" +
-                                "DESPESA: Favorecido %s recebeu R$ %s.\n" +
-                                "ITENS: %s\n" +
-                                "LICITACAO: %s\n" +
-                                "Retorne apenas um JSON: {\"veredito\": \"texto curto\", \"score\": 0}",
-                        d.getNomeFavorecido(), d.getValorPago(), dadosItens, dadosLicitacao
-                );
-
-                String respostaIA = chamarGemini(prompt);
-                Map<String, Object> resultadoIA = mapper.readValue(respostaIA, Map.class);
-
-                d.setVereditoIA(String.valueOf(resultadoIA.get("veredito")));
-                Object scoreObj = resultadoIA.get("score");
-                d.setScoreRisco(scoreObj instanceof Integer ? (Integer) scoreObj : Integer.valueOf(scoreObj.toString()));
-
-                repository.save(d);
-                System.out.println("ID " + d.getId() + " auditado. Score: " + d.getScoreRisco());
-
-                Thread.sleep(15000);
-
-            } catch (Exception e) {
-                System.err.println("Erro no ID " + d.getId() + ": " + e.getMessage());
-            }
+        for (Despesa d : despesas) {
+            executarFluxoAuditoria(d);
         }
-        return "Auditoria finalizada.";
+        return "Auditoria concluída.";
     }
 
+    private void executarFluxoAuditoria(Despesa d) {
+        try {
+            log.info("[GovTrace] Auditando: {}", d.getNomeFavorecido());
+            String dadosCnpj = consultarMcpBrasil("brasilapi_cnpj", Map.of("cnpj", d.getCnpjFavorecido()));
+
+            String prompt = String.format(
+                    "Aja como Auditor do TCE-SP. Analise o risco de fraude:\n" +
+                            "FORNECEDOR: %s | VALOR: R$ %s\n" +
+                            "DADOS CNPJ: %s\n" +
+                            "Responda estritamente em JSON: {\"veredito\": \"texto\", \"score\": 0-100}",
+                    d.getNomeFavorecido(), d.getValorPago(), dadosCnpj
+            );
+
+            String respostaIA = chamarGemini(prompt);
+            JsonNode root = mapper.readTree(respostaIA);
+
+            d.setVereditoIA(root.path("veredito").asText());
+            d.setScoreRisco(root.path("score").asInt());
+            repository.save(d);
+
+            TimeUnit.SECONDS.sleep(2);
+        } catch (Exception e) {
+            log.error("[GovTrace] Erro na auditoria do ID {}: {}", d.getId(), e.getMessage());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
     private String chamarGemini(String prompt) {
         try {
-            Map<String, Object> requestBody = Map.of("contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))));
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
-            ResponseEntity<Map> response = restTemplate.postForEntity(GEMINI_URL, entity, Map.class);
+            Map<String, Object> request = Map.of("contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))));
+            ResponseEntity<Map> response = restTemplate.postForEntity(getGeminiUrl(), request, Map.class);
 
-            List candidates = (List) response.getBody().get("candidates");
-            Map firstCandidate = (Map) candidates.get(0);
-            Map content = (Map) firstCandidate.get("content");
-            List parts = (List) content.get("parts");
-            Map firstPart = (Map) parts.get(0);
+            if (response.getBody() == null) return "{}";
 
-            String text = (String) firstPart.get("text");
+            List<Map<String, Object>> candidates = (List<Map<String, Object>>) response.getBody().get("candidates");
+            Map<String, Object> firstCandidate = candidates.get(0);
+            Map<String, Object> content = (Map<String, Object>) firstCandidate.get("content");
+            List<Map<String, Object>> parts = (List<Map<String, Object>>) content.get("parts");
+            String text = (String) parts.get(0).get("text");
+
             return text.replace("```json", "").replace("```", "").trim();
         } catch (Exception e) {
-            return "{\"veredito\": \"Erro na IA\", \"score\": 0}";
+            log.error("[GovTrace] Erro Gemini: {}", e.getMessage());
+            return "{\"veredito\": \"Erro IA\", \"score\": 0}";
         }
     }
 
-    private String buscarItensReais(String doc) {
+    private String consultarMcpBrasil(String toolName, Map<String, Object> arguments) {
         try {
-            // CHAMADA CORRIGIDA: Apenas 1 argumento
-            List<Map<String, Object>> itens = portalClient.buscarItensDeEmpenho(doc);
-            return (itens != null) ? itens.toString() : "Sem itens.";
-        } catch (Exception e) { return "Erro nos itens."; }
-    }
+            log.info("[GovTrace] Chamando ferramenta MCP via Python: {}", toolName);
+            String jsonArgs = mapper.writeValueAsString(arguments);
 
-    private String buscarParticipantesReais(String doc) {
-        try {
-            // CHAMADA CORRIGIDA: Apenas 1 argumento
-            List<Map<String, Object>> partes = portalClient.buscarParticipantesLicitacao(doc);
-            return (partes != null) ? partes.toString() : "Sem licitantes.";
-        } catch (Exception e) { return "Erro na licitação."; }
+            ProcessBuilder pb = new ProcessBuilder("python", "-m", "mcp_brasil.server", "call", toolName);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            try (var os = process.getOutputStream()) {
+                os.write(jsonArgs.getBytes());
+                os.flush();
+            }
+
+            var reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            process.waitFor(60, TimeUnit.SECONDS);
+
+            String raw = output.toString();
+
+            int startArray = raw.indexOf("[");
+            int startObj = raw.indexOf("{");
+
+            int start = -1;
+            if (startArray != -1 && startObj != -1) start = Math.min(startArray, startObj);
+            else if (startArray != -1) start = startArray;
+            else if (startObj != -1) start = startObj;
+
+            int endArray = raw.lastIndexOf("]");
+            int endObj = raw.lastIndexOf("}");
+            int end = Math.max(endArray, endObj);
+
+            if (start != -1 && end != -1 && start < end) {
+                String finalJson = raw.substring(start, end + 1).trim();
+                log.info("[GovTrace] JSON extraído com sucesso.");
+                return finalJson;
+            }
+
+            log.error("[GovTrace] Falha ao localizar JSON na saída.");
+            return "";
+        } catch (Exception e) {
+            log.error("[GovTrace] Falha crítica na integração MCP: {}", e.getMessage());
+            return "";
+        }
     }
 }

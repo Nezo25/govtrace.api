@@ -1,41 +1,33 @@
 package tfs.com.govtrace.api.controllers;
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import tfs.com.govtrace.api.services.CargaDadosService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
 import tfs.com.govtrace.api.services.GeminiService;
+import tfs.com.govtrace.api.models.Despesa;
+
+import java.util.List;
 
 @RestController
 @RequestMapping("/api/auditoria")
+@RequiredArgsConstructor
 public class AuditoriaController {
 
-    @Autowired
-    private GeminiService geminiService;
+    private final GeminiService geminiService;
 
-    // Endpoint principal para análise inicial
-    @GetMapping("/investigar")
-    public String investigarBase() {
-        return geminiService.analisarBase();
+    /**
+     * 1. DISPARAR AUDITORIA GERAL
+
+     * URL: GET http://localhost:8080/api/auditoria/processar
+     */
+    @GetMapping("/processar")
+    public ResponseEntity<String> processarAuditoria() {
+        // Chama o método que criamos no seu GeminiService
+        String resultado = geminiService.analisarBase();
+        return ResponseEntity.ok(resultado);
     }
-
-    // Para corrigir registros que voltaram com "Erro na IA"
-    @GetMapping("/recuperar")
-    public String recuperarFalhas() {
-        return geminiService.recuperarFalhas();
-
-
-    }
-
-    @Autowired
-    private CargaDadosService cargaService;
-
-    // GET http://localhost:8080/api/auditoria/carregar-base
-    @GetMapping("/carregar-base")
-    public String carregarBase() {
-        // Vamos buscar as primeiras 10 páginas (aprox. 150 registos)
-        return cargaService.carregarMassaDados(1);
-
+    @PostMapping("/carga-dados")
+    public ResponseEntity<String> carga() {
+        return ResponseEntity.ok(geminiService.carregarBaseTransparencia());
     }
 }
