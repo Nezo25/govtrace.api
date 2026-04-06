@@ -12,17 +12,6 @@ import org.springframework.web.client.RestTemplate;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Cliente MCP via Streamable HTTP transport (FastMCP 3.x).
- *
- * O protocolo Streamable HTTP exige:
- *   1. POST /mcp com initialize → recebe mcp-session-id no header de resposta
- *   2. POST /mcp com notifications/initialized (mesmo session-id)
- *   3. POST /mcp com tools/call (mesmo session-id)
- *
- * Servidor: python -c "from mcp_brasil.server import mcp; mcp.run(transport='http', port=8000)"
- * Endpoint: http://localhost:8000/mcp
- */
 @Slf4j
 @Component
 public class McpBrasilClient {
@@ -34,175 +23,103 @@ public class McpBrasilClient {
     @Value("${govtrace.mcp.url:http://localhost:8000/mcp}")
     private String mcpUrl;
 
-    // Session ID negociado no initialize — reutilizado em todas as chamadas
     private volatile String sessionId = null;
     private final Object sessionLock = new Object();
 
-    // -------------------------------------------------------------------------
-    // API pública
-    // -------------------------------------------------------------------------
-
     public String callTool(String toolName, Map<String, Object> arguments) throws Exception {
-        ensureSession();
+        ObjectNode toolParams = mapper.createObjectNode();
+        toolParams.put("name", toolName);
+        toolParams.set("arguments", mapper.valueToTree(arguments));
 
-        ObjectNode params = mapper.createObjectNode();
-        params.put("name", toolName);
-        params.set("arguments", mapper.valueToTree(arguments));
-
-        JsonNode response = sendRequest("tools/call", params, sessionId);
+        JsonNode response = sendRequest("tools/call", toolParams);
 
         if (response.has("error")) {
-            String msg = response.path("error").path("message").asText("Erro desconhecido");
-            throw new RuntimeException("[MCP] Erro da ferramenta '" + toolName + "': " + msg);
+            throw new RuntimeException("Erro MCP: " + response.path("error").path("message").asText());
         }
 
         JsonNode content = response.path("result").path("content");
         if (content.isArray() && !content.isEmpty()) {
-            String text = content.get(0).path("text").asText();
-            log.info("[MCP] '{}' retornou {} caracteres.", toolName, text.length());
-            return text;
+            return content.get(0).path("text").asText();
         }
-
-        log.warn("[MCP] Formato inesperado de '{}': {}", toolName, response);
-        return "{}";
+        return "[]";
     }
-
-    // -------------------------------------------------------------------------
-    // Handshake: initialize → notifications/initialized
-    // -------------------------------------------------------------------------
 
     private void ensureSession() throws Exception {
         if (sessionId != null) return;
-
         synchronized (sessionLock) {
             if (sessionId != null) return;
 
-            log.info("[MCP] Iniciando sessão HTTP com {}...", mcpUrl);
+            log.info("[MCP] Realizando handshake oficial...");
 
-            // ── 1. initialize ──────────────────────────────────────────────
-            int initId = idCounter.getAndIncrement();
-
-            ObjectNode clientInfo = mapper.createObjectNode();
-            clientInfo.put("name", "govtrace-api");
-            clientInfo.put("version", "1.0.0");
-
+            // 1. INITIALIZE (Incluindo capabilities vazias porém presentes)
             ObjectNode initParams = mapper.createObjectNode();
             initParams.put("protocolVersion", "2024-11-05");
-            initParams.set("clientInfo", clientInfo);
             initParams.set("capabilities", mapper.createObjectNode());
+            initParams.set("clientInfo", mapper.createObjectNode()
+                    .put("name", "govtrace-api")
+                    .put("version", "1.0.0"));
 
-            ObjectNode initRequest = buildRequest(initId, "initialize", initParams);
+            ObjectNode initReq = buildRpc(idCounter.getAndIncrement(), "initialize", initParams);
 
-            // No initialize NÃO enviamos session-id — o servidor vai criar e devolver
-            HttpHeaders initHeaders = baseHeaders(null);
-            HttpEntity<String> initEntity = new HttpEntity<>(
-                    mapper.writeValueAsString(initRequest), initHeaders);
+            ResponseEntity<String> resp = restTemplate.postForEntity(mcpUrl,
+                    new HttpEntity<>(mapper.writeValueAsString(initReq), baseHeaders(null)), String.class);
 
-            ResponseEntity<String> initResponse;
-            try {
-                initResponse = restTemplate.postForEntity(mcpUrl, initEntity, String.class);
-            } catch (Exception e) {
-                throw new RuntimeException(
-                        "[MCP] Falha ao conectar em " + mcpUrl +
-                                ". Servidor rodando? (python -c \"from mcp_brasil.server import mcp; mcp.run(transport='http', port=8000)\")", e);
-            }
+            String sid = resp.getHeaders().getFirst("mcp-session-id");
+            if (sid == null) throw new RuntimeException("Handshake falhou: sem mcp-session-id");
 
-            if (!initResponse.getStatusCode().is2xxSuccessful()) {
-                throw new RuntimeException("[MCP] initialize retornou HTTP " + initResponse.getStatusCode()
-                        + " | body: " + initResponse.getBody());
-            }
+            // 2. NOTIFICATIONS/INITIALIZED (Obrigatório para o Python liberar o acesso)
+            ObjectNode notifiedReq = mapper.createObjectNode();
+            notifiedReq.put("jsonrpc", "2.0");
+            notifiedReq.put("method", "notifications/initialized");
+            notifiedReq.set("params", mapper.createObjectNode()); // Params vazio, mas presente
 
-            // Extrai o session-id do header de resposta
-            String sid = initResponse.getHeaders().getFirst("mcp-session-id");
-            if (sid == null || sid.isBlank()) {
-                throw new RuntimeException("[MCP] Servidor não retornou mcp-session-id no initialize.");
-            }
+            restTemplate.postForEntity(mcpUrl,
+                    new HttpEntity<>(mapper.writeValueAsString(notifiedReq), baseHeaders(sid)), String.class);
 
-            log.info("[MCP] Sessão criada: {}", sid);
-
-            // ── 2. notifications/initialized ──────────────────────────────
-            ObjectNode notif = mapper.createObjectNode();
-            notif.put("jsonrpc", "2.0");
-            notif.put("method", "notifications/initialized");
-
-            HttpHeaders notifHeaders = baseHeaders(sid);
-            HttpEntity<String> notifEntity = new HttpEntity<>(
-                    mapper.writeValueAsString(notif), notifHeaders);
-
-            // Notificações podem retornar 202 Accepted ou 200 — ambos OK
-            try {
-                restTemplate.postForEntity(mcpUrl, notifEntity, String.class);
-            } catch (Exception e) {
-                log.warn("[MCP] notifications/initialized retornou erro (não crítico): {}", e.getMessage());
-            }
-
-            sessionId = sid;
-            log.info("[MCP] Sessão pronta.");
+            this.sessionId = sid;
+            log.info("[MCP] Conexão estabelecida com sucesso!");
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+    private JsonNode sendRequest(String method, ObjectNode params) throws Exception {
+        ensureSession();
+        ObjectNode req = buildRpc(idCounter.getAndIncrement(), method, params);
 
-    private JsonNode sendRequest(String method, ObjectNode params, String sid) throws Exception {
-        int id = idCounter.getAndIncrement();
-        ObjectNode request = buildRequest(id, method, params);
+        ResponseEntity<String> resp = restTemplate.postForEntity(mcpUrl,
+                new HttpEntity<>(mapper.writeValueAsString(req), baseHeaders(sessionId)), String.class);
 
-        HttpHeaders headers = baseHeaders(sid);
-        HttpEntity<String> entity = new HttpEntity<>(mapper.writeValueAsString(request), headers);
-
-        log.debug("[MCP] >>> {} (id={})", method, id);
-
-        try {
-            ResponseEntity<String> response = restTemplate.postForEntity(mcpUrl, entity, String.class);
-
-            String body = response.getBody() != null ? response.getBody().trim() : "";
-
-            // Limpeza de SSE (event/data)
-            if (body.contains("data:")) {
-                body = body.substring(body.lastIndexOf("data:") + 5).trim();
-            }
-            if (body.contains("\n")) {
-                for (String line : body.split("\n")) {
-                    if (line.trim().startsWith("{")) {
-                        body = line.trim();
-                        break;
-                    }
-                }
-            }
-
-            return mapper.readTree(body);
-
-        } catch (org.springframework.web.client.HttpClientErrorException.NotFound e) {
-            // --- AQUI ESTÁ O PULO DO GATO ---
-            log.warn("[MCP] Sessão {} não encontrada no servidor. Resetando...", sid);
-            synchronized (sessionLock) {
-                this.sessionId = null; // Força criar nova sessão na próxima chamada
-            }
-            throw new RuntimeException("Sessão expirada. Por favor, tente a requisição novamente.");
-        } catch (Exception e) {
-            log.error("[MCP] Erro na comunicação: {}", e.getMessage());
-            throw e;
-        }
+        return parseSseOrJson(resp.getBody());
     }
 
-    private ObjectNode buildRequest(int id, String method, ObjectNode params) {
-        ObjectNode req = mapper.createObjectNode();
-        req.put("jsonrpc", "2.0");
-        req.put("id", id);
-        req.put("method", method);
-        req.set("params", params);
-        return req;
+    private JsonNode parseSseOrJson(String raw) throws Exception {
+        if (raw == null || raw.isBlank()) return mapper.createObjectNode();
+        JsonNode lastNode = null;
+        for (String line : raw.split("\\r?\\n")) {
+            String jsonPart = line.startsWith("data:") ? line.substring(5).trim() : line.trim();
+            if (jsonPart.startsWith("{")) {
+                try {
+                    JsonNode n = mapper.readTree(jsonPart);
+                    if (n.has("id") || n.has("result")) lastNode = n;
+                } catch (Exception ignored) {}
+            }
+        }
+        return lastNode != null ? lastNode : mapper.readTree(raw);
+    }
+
+    private ObjectNode buildRpc(int id, String method, ObjectNode params) {
+        ObjectNode r = mapper.createObjectNode();
+        r.put("jsonrpc", "2.0");
+        r.put("id", id);
+        r.put("method", method);
+        r.set("params", params != null ? params : mapper.createObjectNode());
+        return r;
     }
 
     private HttpHeaders baseHeaders(String sid) {
         HttpHeaders h = new HttpHeaders();
         h.setContentType(MediaType.APPLICATION_JSON);
-        h.set("Accept", "application/json, text/event-stream");
-        if (sid != null && !sid.isBlank()) {
-            h.set("mcp-session-id", sid);
-        }
+        h.set(HttpHeaders.ACCEPT, "application/json, text/event-stream");
+        if (sid != null) h.set("mcp-session-id", sid);
         return h;
     }
 }

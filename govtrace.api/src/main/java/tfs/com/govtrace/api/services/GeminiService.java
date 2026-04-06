@@ -2,11 +2,13 @@ package tfs.com.govtrace.api.services;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.genai.Client;
+import com.google.genai.types.GenerateContentConfig;
+import com.google.genai.types.GenerateContentResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
 import tfs.com.govtrace.api.models.Despesa;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
 
@@ -20,120 +22,152 @@ public class GeminiService {
 
     private final DespesaRepository repository;
     private final McpBrasilClient mcpClient;
-    private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper mapper = new ObjectMapper();
+    private final Client client;
 
-    @Value("${govtrace.ai.gemini.api-key}")
-    private String geminiKey;
 
-    public GeminiService(DespesaRepository repository, McpBrasilClient mcpClient) {
+    private final String MODEL = "gemini-2.0-flash-lite";
+
+    public GeminiService(DespesaRepository repository,
+                         McpBrasilClient mcpClient,
+                         @Value("${govtrace.ai.gemini.api-key}") String apiKey) {
         this.repository = repository;
-        this.mcpClient  = mcpClient;
+        this.mcpClient = mcpClient;
+        // Inicializa o cliente oficial do Google uma única vez
+        this.client = Client.builder().apiKey(apiKey).build();
     }
 
-    private String getGeminiUrl() {
-        return "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + geminiKey;
-    }
+    // ── Carga de Dados ───────────────────────────────────────────────────────
 
-    /**
-     * Sincroniza dados REAIS do portal do TCE-SP via MCP-Brasil
-     */
-    public String carregarBaseTransparencia() {
+    @Async
+    public void carregarBaseTransparenciaAsync() {
         try {
-            log.info("[GovTrace] MCP-BRASIL: Sincronizando despesas reais de Bragança Paulista...");
+            log.info("[GovTrace] Iniciando carga de Bragança Paulista...");
 
-            Map<String, Object> params = Map.of(
-                    "municipio", "Bragança Paulista",
-                    "ano", 2024,
+            Map<String, Object> args = Map.of(
+                    "municipio", "braganca-paulista",
+                    "exercicio", 2024,
                     "mes", 1
             );
 
+            String textoBruto = mcpClient.callTool("tce_sp_consultar_despesas_sp", args);
 
-            String jsonResposta = mcpClient.callTool("tce_sp", params);
-
-            if (jsonResposta == null || jsonResposta.trim().isEmpty() ||
-                    (!jsonResposta.trim().startsWith("[") && !jsonResposta.trim().startsWith("{"))) {
-                log.error("[GovTrace] Resposta inválida do MCP: {}", jsonResposta);
-                return "Erro: O minerador não retornou um JSON válido.";
+            String jsonExtraido;
+            if (textoBruto.trim().startsWith("[") || textoBruto.trim().startsWith("{")) {
+                jsonExtraido = textoBruto;
+            } else {
+                log.info("[GovTrace] Usando SDK Oficial para extrair JSON...");
+                String prompt = "Extraia APENAS as 10 primeiras despesas para um ARRAY JSON []. " +
+                        "Use os campos: fornecedor, valor, empenho. Não responda nada além do JSON. Texto:\n" + textoBruto;
+                jsonExtraido = chamarGeminiSDK(prompt);
             }
 
-            JsonNode despesasNoPortal = mapper.readTree(jsonResposta);
-
-            if (despesasNoPortal.isArray()) {
-                for (JsonNode item : despesasNoPortal) {
-                    Despesa d = Despesa.builder()
-                            .nomeFavorecido(item.path("nm_fornecedor").asText("Desconhecido"))
-                            .cnpjFavorecido(item.path("nr_cnpj_cpf_fornecedor").asText("00000000000000"))
-                            .valorPago(item.path("vl_despesa").asText("0.00"))
-                            .dataPagamento(item.path("dt_emissao_despesa").asText("2024-01-01"))
-                            .documentoOrigem("TCE-SP-" + item.path("nr_empenho").asText("SN"))
-                            .build();
-                    repository.save(d);
-                }
-                return "Sucesso! " + despesasNoPortal.size() + " registros reais importados de Bragança Paulista.";
+            if (!jsonExtraido.startsWith("ERRO:")) {
+                processarResposta(jsonExtraido);
+            } else {
+                log.error("[GovTrace] Falha na IA: {}", jsonExtraido);
             }
-            return "Nenhum dado encontrado para o período.";
 
         } catch (Exception e) {
-            log.error("[GovTrace] Erro técnico na integração: {}", e.getMessage());
-            return "Erro técnico: " + e.getMessage();
+            log.error("[GovTrace] Falha na carga: {}", e.getMessage());
         }
     }
+    private String processarResposta(String jsonResposta) throws Exception {
+        // O SDK novo já tende a vir limpo, mas vamos garantir o parse
+        int start = jsonResposta.indexOf("[");
+        int end = jsonResposta.lastIndexOf("]");
+        if (start == -1 || end == -1) return "Erro: Formato inválido.";
 
-    public String analisarBase() {
+        String jsonLimpo = jsonResposta.substring(start, end + 1);
+        JsonNode despesasNode = mapper.readTree(jsonLimpo);
+
+        int novos = 0;
+        for (JsonNode item : despesasNode) {
+            String empenho = item.path("empenho").asText("0");
+            String idOrigem = "TCE-" + empenho;
+
+            if (repository.existsByDocumentoOrigem(idOrigem)) continue;
+
+            Despesa d = Despesa.builder()
+                    .nomeFavorecido(item.path("fornecedor").asText("N/A"))
+                    .valorPago(item.path("valor").asText("0,00"))
+                    .documentoOrigem(idOrigem)
+                    .build();
+
+            repository.save(d);
+            novos++;
+        }
+
+        log.info("[GovTrace] Sucesso! {} registros salvos.", novos);
+        return String.format("Carga finalizada: %d novos registros salvos.", novos);
+    }
+
+    // ── Auditoria ────────────────────────────────────────────────────────────
+
+    @Async
+    public void analisarBase() {
         List<Despesa> pendentes = repository.findAll().stream()
                 .filter(d -> d.getVereditoIA() == null || d.getVereditoIA().isEmpty())
                 .toList();
 
-        if (pendentes.isEmpty()) return "Sem pendências para auditar.";
+        for (Despesa d : pendentes) {
+            try {
+                String prompt = String.format(
+                        "Aja como Auditor. Analise o risco de fraude: Fornecedor %s | Valor %s. " +
+                                "Responda apenas JSON: {\"veredito\": \"...\", \"score\": 0-100}",
+                        d.getNomeFavorecido(), d.getValorPago());
 
-        log.info("[GovTrace] Auditando {} registros com Gemini...", pendentes.size());
-        pendentes.forEach(this::executarFluxoAuditoria);
-        return "Auditoria concluída.";
-    }
+                String resposta = chamarGeminiSDK(prompt);
+                JsonNode node = mapper.readTree(resposta.substring(resposta.indexOf("{"), resposta.lastIndexOf("}") + 1));
 
-    private void executarFluxoAuditoria(Despesa d) {
-        try {
-            log.info("[GovTrace] Buscando dados CNPJ para: {}", d.getNomeFavorecido());
+                d.setVereditoIA(node.path("veredito").asText("Concluído"));
+                d.setScoreRisco(node.path("score").asInt(0));
+                repository.save(d);
 
-            // Voltamos para o nome original da ferramenta brasilapi_cnpj
-            String dadosCnpj = mcpClient.callTool("brasilapi_cnpj", Map.of("cnpj", d.getCnpjFavorecido()));
-
-            String prompt = String.format(
-                    "Aja como Auditor do TCE-SP. Analise o risco de fraude:\n" +
-                            "FORNECEDOR: %s | VALOR: R$ %s\n" +
-                            "DADOS REAIS CNPJ: %s\n\n" +
-                            "Responda estritamente em JSON: {\"veredito\": \"texto\", \"score\": 0-100}",
-                    d.getNomeFavorecido(), d.getValorPago(), dadosCnpj
-            );
-
-            String respostaIA = chamarGemini(prompt);
-            JsonNode root = mapper.readTree(respostaIA);
-
-            d.setVereditoIA(root.path("veredito").asText("Análise indisponível"));
-            d.setScoreRisco(root.path("score").asInt(0));
-            repository.save(d);
-
-            TimeUnit.SECONDS.sleep(1);
-        } catch (Exception e) {
-            log.error("[GovTrace] Falha no registro {}: {}", d.getId(), e.getMessage());
+                TimeUnit.SECONDS.sleep(5);
+            } catch (Exception e) {
+                log.error("Erro no registro {}: {}", d.getId(), e.getMessage());
+            }
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private String chamarGemini(String prompt) {
-        try {
-            Map<String, Object> body = Map.of("contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))));
-            ResponseEntity<Map> response = restTemplate.postForEntity(getGeminiUrl(), body, Map.class);
+    // ── Motor Gemini (Via SDK) ──────────────────────────────────────────────
 
-            if (response.getBody() == null) return "{}";
+    private String chamarGeminiSDK(String prompt) {
+        int tentativas = 3;
+        for (int i = 0; i < tentativas; i++) {
+            try {
+                GenerateContentConfig config = GenerateContentConfig.builder()
+                        .responseMimeType("application/json")
+                        .build();
+                return client.models.generateContent(MODEL, prompt, config).text();
 
-            List<Map<String, Object>> candidates = (List<Map<String, Object>>) response.getBody().get("candidates");
-            Map<String, Object> content = (Map<String, Object>) candidates.get(0).get("content");
-            List<Map<String, Object>> parts = (List<Map<String, Object>>) content.get("parts");
-            return parts.get(0).get("text").toString().replaceAll("(?s)```json\\s*|```\\s*", "").trim();
-        } catch (Exception e) {
-            return "{\"veredito\": \"Erro na IA\", \"score\": 0}";
+            } catch (Exception e) {
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (msg.contains("429") && i < tentativas - 1) {
+                    long espera = extrairRetryAfter(msg);
+                    log.warn("[Gemini] Rate limit, aguardando {}ms...", espera);
+                    try { TimeUnit.MILLISECONDS.sleep(espera); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                } else {
+                    log.error("[Gemini SDK Error] {}", msg);
+                    return "ERRO: " + msg;
+                }
+            }
         }
+        return "ERRO: Limite de tentativas atingido.";
     }
-}
+
+    private long extrairRetryAfter(String msg) {
+        try {
+            // Tenta ler "Please retry in XX.XXXs" da mensagem
+            int idx = msg.indexOf("Please retry in ");
+            if (idx != -1) {
+                String sub = msg.substring(idx + 16);
+                String segundos = sub.replaceAll("[^0-9.]", "").split("\\.")[0];
+                return (Long.parseLong(segundos) + 2) * 1000L; // +2s de margem
+            }
+        } catch (Exception ignored) {}
+        return 40_000L; // fallback: 40 segundos
+    }
+
+    }

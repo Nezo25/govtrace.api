@@ -23,4 +23,7 @@ public interface DespesaRepository extends JpaRepository<Despesa, Long> {
     Optional<Despesa> findByDocumentoOrigem(String documentoOrigem);
 
     List<Despesa> findAllByOrderByScoreRiscoDesc();
+
+    // Verifica existência de forma rápida para evitar duplicidade na carga
+    boolean existsByDocumentoOrigem(String documentoOrigem);
 }

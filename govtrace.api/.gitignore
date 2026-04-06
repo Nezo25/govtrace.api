@@ -1,34 +1,26 @@
-node_modules
-HELP.md
+### Java e Maven ###
 target/
-.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
+*.class
+*.jar
+*.war
+*.ear
+*.log
 
-### STS ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
-
-### IntelliJ IDEA ###
-.idea
-*.iws
+### IDEs (IntelliJ, Eclipse, VS Code) ###
+.idea/
 *.iml
-*.ipr
-
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
-build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
+.classpath
+.project
+.settings/
+bin/
 .vscode/
+
+### Configurações Sensíveis (O mais importante!) ###
+# Bloqueia arquivos que podem conter sua API KEY
+application-local.properties
+.env
+secret.properties
+
+### Sistema Operacional ###
+DS_Store
+Thumbs.db
