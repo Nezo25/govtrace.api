@@ -5,49 +5,48 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import tfs.com.govtrace.api.models.Despesa;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
-import tfs.com.govtrace.api.services.GeminiService;
+import tfs.com.govtrace.api.service.AuditoriaService; // Novo Service
 
 import java.util.List;
 import java.util.stream.Collectors;
 
 /**
- * Controller responsável por gerenciar o ciclo de vida da auditoria:
- * Carga de dados, Disparo de análise e Visualização de riscos.
+ * Controller evoluído para Java 21 + Virtual Threads.
+ * Cérebro da auditoria do GovTrace rodando na Groq.
  */
 @RestController
 @RequestMapping("/api/auditoria")
 @RequiredArgsConstructor
-@CrossOrigin(origins = "*") // Permite integração com Frontend
+@CrossOrigin(origins = "*")
 public class AuditoriaController {
 
     private final DespesaRepository repository;
-    private final GeminiService geminiService;
+    private final AuditoriaService auditoriaService; // Substituiu o GeminiService
 
     /**
-     * 1. CARGA DE DADOS (TCE-SP -> IA -> Banco)
-     * URL: POST http://localhost:8080/api/auditoria/carga-dados
+     * 1. CARGA DE DADOS
+     * Mantemos a lógica de carga, mas agora integrada à nova infra.
      */
     @PostMapping("/carga-dados")
     public ResponseEntity<String> carregarDados() {
-        geminiService.carregarBaseTransparenciaAsync(); // dispara em background
-        return ResponseEntity.accepted().body("Carga iniciada em background. Aguarde alguns minutos.");
+        auditoriaService.carregarBaseTransparenciaAsync();
+        return ResponseEntity.accepted().body("Carga iniciada via Virtual Threads. Aguarde.");
     }
 
     /**
-     * 2. DISPARAR ANÁLISE DE RISCO (Background via IA)
-     * URL: POST http://localhost:8080/api/auditoria/disparar-analise
+     * 2. DISPARAR ANÁLISE DE RISCO
+     * Aqui é onde a Groq e as Virtual Threads brilham.
      */
     @PostMapping("/disparar-analise")
     public ResponseEntity<String> dispararAnalise() {
-        // Como o método no Service é @Async, ele retorna imediatamente
-        geminiService.analisarBase();
+        // O método no service agora processa em paralelo de forma eficiente
+        auditoriaService.analisarBaseComIA();
         return ResponseEntity.accepted()
-                .body("Auditoria iniciada em segundo plano. Monitore os logs e o Ranking de Risco.");
+                .body("Auditoria iniciada na Groq. Alta performance via Llama 3.3 70B.");
     }
 
     /**
      * 3. RANKING DE RISCO COMPLETO
-     * URL: GET http://localhost:8080/api/auditoria/ranking-risco
      */
     @GetMapping("/ranking-risco")
     public ResponseEntity<List<Despesa>> getRankingRisco() {
@@ -56,7 +55,6 @@ public class AuditoriaController {
 
     /**
      * 4. CASOS CRÍTICOS (Top 10 com Score > 80)
-     * URL: GET http://localhost:8080/api/auditoria/casos-criticos
      */
     @GetMapping("/casos-criticos")
     public ResponseEntity<List<Despesa>> getCasosCriticos() {
@@ -70,8 +68,7 @@ public class AuditoriaController {
     }
 
     /**
-     * 5. LIMPAR BASE (Opcional - Útil para testes do TCC)
-     * URL: DELETE http://localhost:8080/api/auditoria/limpar
+     * 5. LIMPAR BASE
      */
     @DeleteMapping("/limpar")
     public ResponseEntity<String> limparBase() {

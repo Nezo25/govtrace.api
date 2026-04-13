@@ -1,29 +1,26 @@
 package tfs.com.govtrace.api.repositories;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
 import org.springframework.stereotype.Repository;
 import tfs.com.govtrace.api.models.Despesa;
 
 import java.util.List;
-import java.util.Optional;
 
 @Repository
 public interface DespesaRepository extends JpaRepository<Despesa, Long> {
 
-    // Busca todas as despesas de uma emenda específica
-    List<Despesa> findByCodigoEmenda(String codigoEmenda);
-
-    // Busca por CNPJ para ver quanto uma empresa recebeu no total
-    List<Despesa> findByCnpjFavorecido(String cnpjFavorecido);
-
-    // Busca despesas com valor pago acima de um limite (para auditoria de risco)
-    List<Despesa> findByValorPagoGreaterThan(String valorMinimo);
-
-    // Verifica se uma despesa já foi importada para não duplicar no MySQL
-    Optional<Despesa> findByDocumentoOrigem(String documentoOrigem);
-
+    /** Ranking decrescente de risco — usado pelo endpoint principal. */
     List<Despesa> findAllByOrderByScoreRiscoDesc();
 
-    // Verifica existência de forma rápida para evitar duplicidade na carga
+    /** Impede duplicatas entre recargas de dados. */
     boolean existsByDocumentoOrigem(String documentoOrigem);
+
+    /** Casos críticos: score acima do threshold. */
+    @Query("SELECT d FROM Despesa d WHERE d.scoreRisco > :threshold ORDER BY d.scoreRisco DESC")
+    List<Despesa> findCasosCriticos(int threshold);
+
+    /** Pendentes de auditoria pela IA. */
+    @Query("SELECT d FROM Despesa d WHERE d.vereditoIA IS NULL OR d.vereditoIA = ''")
+    List<Despesa> findPendentesDeAuditoria();
 }
