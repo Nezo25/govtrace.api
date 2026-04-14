@@ -17,6 +17,8 @@ public class Despesa {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    private String municipio;
+
     @JsonProperty("codigoEmenda")
     private String codigoEmenda;
 
@@ -34,16 +36,15 @@ public class Despesa {
     private String dataPagamento;
 
     @JsonProperty("documentoOrigem")
+    @Column(unique = true)
     private String documentoOrigem;
 
-    // Relacionamento opcional para facilitar buscas internas
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "emenda_id")
     private Emenda emenda;
 
-    // Campo de auditoria para a IA
     @Column(columnDefinition = "TEXT")
     private String vereditoIA;
 
-    private Integer scoreRisco; // 0 a 100
+    private Integer scoreRisco;
 }
