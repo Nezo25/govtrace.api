@@ -122,4 +122,10 @@ public class McpBrasilClient {
         if (sid != null) h.set("mcp-session-id", sid);
         return h;
     }
+
+
+    public String listTools() throws Exception {
+        JsonNode response = sendRequest("tools/list", mapper.createObjectNode());
+        return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(response);
+    }
 }

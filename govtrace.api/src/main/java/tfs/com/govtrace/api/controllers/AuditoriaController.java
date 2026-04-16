@@ -6,8 +6,10 @@ import org.springframework.web.bind.annotation.*;
 import tfs.com.govtrace.api.models.Despesa;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
 import tfs.com.govtrace.api.services.AuditoriaService;
+import tfs.com.govtrace.api.services.McpBrasilClient;
 
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -29,6 +31,7 @@ public class AuditoriaController {
 
     private final DespesaRepository repository;
     private final AuditoriaService auditoriaService;
+    private final McpBrasilClient mcpClient;
 
     /**
      * Carrega despesas reais do TCE-SP via mcp-brasil.
@@ -89,5 +92,16 @@ public class AuditoriaController {
     public ResponseEntity<String> limparBase() {
         repository.deleteAll();
         return ResponseEntity.ok("Base limpa.");
+    }
+
+    @GetMapping("/debug/tools")
+    public ResponseEntity<String> listTools() throws Exception {
+        return ResponseEntity.ok(mcpClient.listTools());
+    }
+    @GetMapping("/debug/schema-tce")
+    public ResponseEntity<String> schemaTce() throws Exception {
+        String result = mcpClient.callTool("search_tools",
+                Map.of("query", "tce_sp consultar despesas municipio"));
+        return ResponseEntity.ok(result);
     }
 }

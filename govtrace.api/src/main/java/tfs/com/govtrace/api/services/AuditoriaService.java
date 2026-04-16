@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 import tfs.com.govtrace.api.models.Despesa;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Semaphore;
@@ -36,19 +37,21 @@ public class AuditoriaService {
     // ── Carga de Dados Dinâmica ──────────────────────────────────────────
 
     public void carregarBaseTransparenciaAsync(String municipioSlug, int ano, int mes) {
-        log.info("[Carga] Solicitando dados de {} ({} / {}) via MCP...", municipioSlug, mes, ano);
+        log.info("[Carga] Solicitando dados de {} ({}/{}) via MCP...", municipioSlug, mes, ano);
         try {
-            String jsonRaw = mcpClient.callTool(
-                    "tce_sp_consultar_despesas_sp",
-                    Map.of(
-                            "municipio", municipioSlug,
-                            "exercicio", ano,
-                            "mes", mes
-                    )
-            );
+            // Monta lote com todos os meses do ano
+            List<Map<String, Object>> consultas = new ArrayList<>();
+            for (int m = 1; m <= 12; m++) {
+                consultas.add(Map.of(
+                        "tool", "tce_sp_consultar_despesas_sp",
+                        "args", Map.of("municipio", municipioSlug, "exercicio", ano, "mes", m)
+                ));
+            }
+
+            String jsonRaw = mcpClient.callTool("executar_lote", Map.of("consultas", consultas));
 
             log.info("[Carga] Dados recebidos. Iniciando processamento...");
-            int salvos = mapearESalvar(jsonRaw, municipioSlug);
+            mapearESalvar(jsonRaw, municipioSlug);
             log.info("[Carga] Finalizada! Total no banco: {}", repository.count());
 
         } catch (Exception e) {
@@ -138,7 +141,7 @@ public class AuditoriaService {
     public void analisarBaseComIA() {
         // Pega apenas 5 por vez para não estourar o limite de tokens da Groq
         List<Despesa> pendentes = repository.findPendentesDeAuditoria()
-                .stream().limit(5).toList();
+                .stream().limit(15).toList();
 
         if (pendentes.isEmpty()) {
             log.info("[Auditoria] Nenhuma despesa pendente.");
