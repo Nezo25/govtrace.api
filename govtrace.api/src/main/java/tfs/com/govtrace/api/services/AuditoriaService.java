@@ -4,21 +4,18 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Async;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import tfs.com.govtrace.api.models.Despesa;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * Orquestrador de Inteligência e Dados da Three Frog System (TFS).
- * Implementa processamento assíncrono para garantir performance de mercado.
- */
 @Service
 @Slf4j
 @RequiredArgsConstructor
@@ -28,49 +25,44 @@ public class AuditoriaService {
     private final DespesaRepository repository;
     private final McpBrasilClient mcpClient;
     private final ObjectMapper mapper = new ObjectMapper();
+    private final KafkaTemplate<String, String> kafkaTemplate;
 
-    // ── CARGA DE DADOS ASSÍNCRONA (CICLO ANUAL) ──────────────────────────
-
-    /**
-     * Realiza a carga de 12 meses de dados em background.
-     * Resolve a limitação de 30 registros por chamada do MCP de forma elegante.
-     */
-    @Async
-    public CompletableFuture<Void> carregarBaseTransparenciaAnual(String municipioSlug, int ano) {
-        log.info("[Carga Task] Iniciando indexação assíncrona do exercício {} para {}...", ano, municipioSlug);
-
-        int totalSalvoNoAno = 0;
-
+    // --- PRODUCER: Envia as solicitações para o tópico ---
+    public void solicitarCargaAnual(String municipio, int ano) {
+        log.info("[Kafka] Criando eventos de carga para {}/{}", municipio, ano);
         for (int m = 1; m <= 12; m++) {
-            try {
-                log.info("[Carga Task] Processando mês {}/{}...", m, ano);
-
-                String jsonRaw = mcpClient.callTool(
-                        "tce_sp_consultar_despesas_sp",
-                        Map.of(
-                                "municipio", municipioSlug,
-                                "exercicio", ano,
-                                "mes", m
-                        )
-                );
-
-                int salvosNoMes = mapearESalvar(jsonRaw, municipioSlug);
-                totalSalvoNoAno += salvosNoMes;
-
-                // Delay estratégico para não sobrecarregar o túnel MCP
-                Thread.sleep(400);
-
-            } catch (Exception e) {
-                log.error("[Carga Task] Erro no mês {}/{}: {}", m, ano, e.getMessage());
-            }
+            String payload = String.format("%s;%d;%d", municipio, ano, m);
+            kafkaTemplate.send("fila-carga-tce", payload);
         }
-        log.info("[Carga Task] CONCLUÍDA! {} registros indexados para {}.", totalSalvoNoAno, municipioSlug);
-        return CompletableFuture.completedFuture(null);
+    }
+
+    // --- CONSUMER: Processa cada mês conforme a fila anda ---
+    @KafkaListener(topics = "fila-carga-tce", groupId = "govtrace-group")
+    public void processarMensagemCarga(String payload) {
+        String[] dados = payload.split(";");
+        String municipio = dados[0];
+        int ano = Integer.parseInt(dados[1]);
+        int mes = Integer.parseInt(dados[2]);
+
+        log.info("[Kafka Consumer] Processando Mês: {}/{}", mes, ano);
+
+        try {
+            String jsonRaw = mcpClient.callTool(
+                    "tce_sp_consultar_despesas_sp",
+                    Map.of("municipio", municipio, "exercicio", ano, "mes", mes)
+            );
+
+            int salvos = mapearESalvar(jsonRaw, municipio);
+            log.info("[Kafka Consumer] Mês {} finalizado. Registros novos: {}", mes, salvos);
+
+            Thread.sleep(800);
+        } catch (Exception e) {
+            log.error("[Kafka Consumer] Erro ao processar {}/{}: {}", mes, ano, e.getMessage());
+        }
     }
 
     private int mapearESalvar(String jsonRaw, String municipio) {
         int count = 0;
-        // Tenta parsear como JSON estruturado primeiro
         if (jsonRaw != null && jsonRaw.contains("{")) {
             try {
                 String jsonLimpo = jsonRaw.substring(jsonRaw.indexOf("{"));
@@ -84,10 +76,9 @@ public class AuditoriaService {
                     return count;
                 }
             } catch (Exception e) {
-                log.warn("[Carga] Formato JSON não estruturado, recorrendo ao Regex.");
+                log.warn("[Carga] Falha no JSON estruturado, tentando Regex fallback...");
             }
         }
-        // Fallback para Regex (limpeza de Markdown/Asteriscos)
         return extrairViaRegex(jsonRaw, municipio);
     }
 
@@ -105,13 +96,13 @@ public class AuditoriaService {
                             .nomeFavorecido(matcher.group(2).trim())
                             .valorPago(matcher.group(3).trim())
                             .documentoOrigem(empenho)
-                            .dataPagamento("2024-01-01") // Placeholder para análise de competência
+                            .dataPagamento("2024-01-01")
                             .build();
                     repository.save(d);
                     count++;
                 }
             } catch (Exception e) {
-                log.debug("Linha Regex inválida ignorada.");
+                log.debug("Linha ignorada no Regex.");
             }
         }
         return count;
@@ -132,28 +123,16 @@ public class AuditoriaService {
         return true;
     }
 
-    // ── AUDITORIA COM IA (GROQ) ──────────────────────────────────────────
-
-    /**
-     * Auditoria assíncrona. Dispara as análises sem bloquear a aplicação.
-     */
-    @Async
+    // --- AUDITORIA IA ---
     public void analisarBaseComIA() {
         List<Despesa> pendentes = repository.findPendentesDeAuditoria()
                 .stream().limit(15).toList();
 
-        if (pendentes.isEmpty()) {
-            log.info("[Auditoria Task] Sem despesas pendentes para análise.");
-            return;
-        }
-
-        log.info("[Auditoria Task] Analisando lote de {} registros...", pendentes.size());
+        if (pendentes.isEmpty()) return;
 
         for (Despesa despesa : pendentes) {
             try {
-                // Intervalo de segurança para o Rate Limit do Llama 3.3 70B (Free Tier)
                 Thread.sleep(3000);
-
                 String context = String.format("Cidade: %s | Favorecido: %s | Valor: R$ %s | Doc: %s",
                         despesa.getMunicipio(), despesa.getNomeFavorecido(),
                         despesa.getValorPago(), despesa.getDocumentoOrigem());
@@ -162,18 +141,10 @@ public class AuditoriaService {
                 despesa.setVereditoIA(veredito);
                 despesa.setScoreRisco(extrairScore(veredito));
                 repository.save(despesa);
-
-                log.info("[Auditoria Task] Veredito concluído para: {}", despesa.getNomeFavorecido());
-
             } catch (Exception e) {
-                log.error("[Auditoria Task] Falha no ID {}: {}", despesa.getId(), e.getMessage());
-                if (e.getMessage() != null && e.getMessage().contains("429")) {
-                    log.warn("[Auditoria Task] Rate Limit atingido. Encerrando lote.");
-                    break;
-                }
+                if (e.getMessage() != null && e.getMessage().contains("429")) break;
             }
         }
-        log.info("[Auditoria Task] Lote finalizado.");
     }
 
     private Integer extrairScore(String analise) {
@@ -184,5 +155,37 @@ public class AuditoriaService {
         if (t.contains("SUSPEITO")) return 70;
         if (t.contains("ATENÇÃO")) return 55;
         return 15;
+    }
+
+    // --- NOVAS FUNCIONALIDADES PARA DASHBOARD E EMENDAS ---
+
+    /**
+     * Gera estatísticas consolidadas para os gráficos do Front-End.
+     */
+    public Map<String, Object> obterEstatisticasDashboard() {
+        List<Despesa> todas = repository.findAll();
+
+        long criticos = todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() >= 80).count();
+        long suspeitos = todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() >= 50 && d.getScoreRisco() < 80).count();
+        long regulares = todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() < 50).count();
+        long pendentes = todas.stream().filter(d -> d.getVereditoIA() == null).count();
+
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("totalProcessado", todas.size());
+        stats.put("criticos", criticos);
+        stats.put("suspeitos", suspeitos);
+        stats.put("regulares", regulares);
+        stats.put("aguardandoIA", pendentes);
+
+        return stats;
+    }
+
+    /**
+     * Tenta vincular despesas existentes a emendas parlamentares pelo nome do favorecido.
+     * Útil para detectar desvios em verbas carimbadas.
+     */
+    public void realizarCruzamentoEmendas() {
+        log.info("[Auditoria] Iniciando cruzamento de dados Despesas x Emendas...");
+        // Futura implementação: Repositorio de Emendas parlamentares
     }
 }
