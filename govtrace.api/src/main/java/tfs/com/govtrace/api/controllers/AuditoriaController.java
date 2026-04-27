@@ -1,87 +1,132 @@
 package tfs.com.govtrace.api.controllers;
 
+import com.fasterxml.jackson.databind.MappingIterator;
+import com.fasterxml.jackson.dataformat.csv.CsvMapper;
+import com.fasterxml.jackson.dataformat.csv.CsvSchema;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import jakarta.servlet.http.HttpServletResponse;
+import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 import tfs.com.govtrace.api.models.Despesa;
+import tfs.com.govtrace.api.models.TransporteAuditoria;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
+import tfs.com.govtrace.api.repositories.EmendaRepository;
+import tfs.com.govtrace.api.repositories.TransporteRepository;
 import tfs.com.govtrace.api.services.AuditoriaService;
 
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
-/**
- * Controller principal da Three Frog System (TFS).
- * Agora integrado com Apache Kafka para resiliência.
- */
 @RestController
 @RequestMapping("/api/auditoria")
 @RequiredArgsConstructor
 @CrossOrigin(origins = "*")
 public class AuditoriaController {
 
-    private final DespesaRepository repository;
+    private final EmendaRepository emendaRepository;
+    private final DespesaRepository despesaRepository;
+    private final TransporteRepository transporteRepository;
     private final AuditoriaService auditoriaService;
 
     /**
-     * Envia o pedido de carga para o Kafka.
-     * O Kafka vai processar os 12 meses um por um em background.
+     * CARGA DE DADOS — flexível por cidade + intervalo de anos.
+     *
+     * Exemplos:
+     *   POST /api/auditoria/carga-dados?cidade=braganca-paulista&anoInicio=2024&anoFim=2024
+     *   POST /api/auditoria/carga-dados?cidade=campinas&anoInicio=2022&anoFim=2024
+     *
+     * Se anoFim não for informado, usa o mesmo valor de anoInicio (só um ano).
      */
     @PostMapping("/carga-dados")
     public ResponseEntity<String> carregarDados(
             @RequestParam(defaultValue = "braganca-paulista") String cidade,
-            @RequestParam(defaultValue = "2024") int ano) {
+            @RequestParam(defaultValue = "2024") int anoInicio,
+            @RequestParam(required = false) Integer anoFim) {
 
+        int fim = (anoFim != null) ? anoFim : anoInicio;
 
-        auditoriaService.solicitarCargaAnual(cidade, ano);
+        if (fim < anoInicio) {
+            return ResponseEntity.badRequest()
+                    .body("anoFim não pode ser menor que anoInicio.");
+        }
 
-        return ResponseEntity.accepted().body("Solicitação de carga anual enviada para a fila do Kafka. " +
-                "Cidade: " + cidade + " | Ano: " + ano);
+        int totalMeses = (fim - anoInicio + 1) * 12;
+        auditoriaService.solicitarCarga(cidade, anoInicio, fim);
+
+        return ResponseEntity.accepted().body(String.format(
+                "Carga iniciada para %s | %d → %d | %d mensagens enfileiradas.",
+                cidade, anoInicio, fim, totalMeses));
     }
 
-    /**
-     * Dispara análise de risco via Groq em background.
-     */
+    @PostMapping("/upload-transporte")
+    public ResponseEntity<String> uploadTransporte(@RequestParam("arquivo") MultipartFile file) {
+        if (file.isEmpty()) return ResponseEntity.badRequest().body("Arquivo vazio.");
+        try {
+            CsvMapper mapper = new CsvMapper();
+            mapper.registerModule(new JavaTimeModule());
+            CsvSchema schema = CsvSchema.emptySchema().withHeader();
+            MappingIterator<TransporteAuditoria> it = mapper.readerFor(TransporteAuditoria.class)
+                    .with(schema).readValues(file.getInputStream());
+            List<TransporteAuditoria> dados = it.readAll();
+            transporteRepository.saveAll(dados);
+            return ResponseEntity.ok("Sucesso! " + dados.size() + " registros importados.");
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body("Erro: " + e.getMessage());
+        }
+    }
+
     @PostMapping("/disparar-analise")
     public ResponseEntity<String> dispararAnalise() {
         auditoriaService.analisarBaseComIA();
-        return ResponseEntity.ok("Processo de auditoria por IA iniciado.");
+        return ResponseEntity.ok("Análise por IA iniciada.");
     }
 
-    /**
-     * Ranking completo de despesas por score de risco (maior → menor).
-     */
     @GetMapping("/ranking-risco")
     public ResponseEntity<List<Despesa>> getRankingRisco() {
-        return ResponseEntity.ok(repository.findAllByOrderByScoreRiscoDesc());
+        return ResponseEntity.ok(despesaRepository.findAllByOrderByScoreRiscoDesc());
     }
 
-    /**
-     * Top 10 casos mais críticos (score > 80).
-     */
-    @GetMapping("/casos-criticos")
-    public ResponseEntity<List<Despesa>> getCasosCriticos() {
-        List<Despesa> criticos = repository.findCasosCriticos(80)
-                .stream()
-                .limit(10)
-                .collect(Collectors.toList());
-        return ResponseEntity.ok(criticos);
-    }
-
-    /**
-     * Despesas ainda não analisadas pela IA.
-     */
     @GetMapping("/pendentes")
     public ResponseEntity<List<Despesa>> getPendentes() {
-        return ResponseEntity.ok(repository.findPendentesDeAuditoria());
+        return ResponseEntity.ok(despesaRepository.findPendentesDeAuditoria());
     }
 
-    /**
-     * Limpa toda a base local.
-     */
+    @GetMapping("/dashboard")
+    public ResponseEntity<Map<String, Object>> getDashboard() {
+        return ResponseEntity.ok(auditoriaService.obterEstatisticasDashboard());
+    }
+
     @DeleteMapping("/limpar")
+    @Transactional
     public ResponseEntity<String> limparBase() {
-        repository.deleteAll();
-        return ResponseEntity.ok("Base de dados limpa com sucesso.");
+        try {
+            despesaRepository.deleteAll();
+            emendaRepository.deleteAll();
+            transporteRepository.deleteAll();
+            return ResponseEntity.ok("Base resetada com sucesso.");
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body("Erro: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/exportar-auditoria")
+    public void exportarRelatorio(HttpServletResponse response) throws IOException {
+        response.setContentType("text/csv");
+        response.setHeader("Content-Disposition", "attachment; filename=auditoria_govtrace.csv");
+        PrintWriter writer = response.getWriter();
+        writer.println("Documento;Favorecido;Valor;Risco;Veredito_IA");
+        despesaRepository.findAllByOrderByScoreRiscoDesc().forEach(d -> {
+            String nome = d.getNomeFavorecido() != null ? d.getNomeFavorecido() : "";
+            String nomeMascarado = nome.length() > 15 ? nome.substring(0, 12) + "..." : nome;
+            writer.println(String.format("%s;%s;%s;%s;%s",
+                    d.getDocumentoOrigem(), nomeMascarado, d.getValorPago(),
+                    d.getScoreRisco(), d.getVereditoIA()));
+        });
     }
 }

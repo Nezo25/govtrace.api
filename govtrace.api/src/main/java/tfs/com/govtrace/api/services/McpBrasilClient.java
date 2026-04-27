@@ -26,6 +26,17 @@ public class McpBrasilClient {
     private volatile String sessionId = null;
     private final Object sessionLock = new Object();
 
+    /**
+     * Reseta a sessão forçando novo handshake na próxima chamada.
+     * Necessário quando o MCP expira a sessão entre mensagens do Kafka.
+     */
+    public void resetSession() {
+        synchronized (sessionLock) {
+            log.info("[MCP] Resetando sessão...");
+            this.sessionId = null;
+        }
+    }
+
     public String callTool(String toolName, Map<String, Object> arguments) throws Exception {
         ObjectNode toolParams = mapper.createObjectNode();
         toolParams.put("name", toolName);
@@ -51,7 +62,6 @@ public class McpBrasilClient {
 
             log.info("[MCP] Realizando handshake oficial...");
 
-            // 1. INITIALIZE (Incluindo capabilities vazias porém presentes)
             ObjectNode initParams = mapper.createObjectNode();
             initParams.put("protocolVersion", "2024-11-05");
             initParams.set("capabilities", mapper.createObjectNode());
@@ -67,17 +77,16 @@ public class McpBrasilClient {
             String sid = resp.getHeaders().getFirst("mcp-session-id");
             if (sid == null) throw new RuntimeException("Handshake falhou: sem mcp-session-id");
 
-            // 2. NOTIFICATIONS/INITIALIZED (Obrigatório para o Python liberar o acesso)
             ObjectNode notifiedReq = mapper.createObjectNode();
             notifiedReq.put("jsonrpc", "2.0");
             notifiedReq.put("method", "notifications/initialized");
-            notifiedReq.set("params", mapper.createObjectNode()); // Params vazio, mas presente
+            notifiedReq.set("params", mapper.createObjectNode());
 
             restTemplate.postForEntity(mcpUrl,
                     new HttpEntity<>(mapper.writeValueAsString(notifiedReq), baseHeaders(sid)), String.class);
 
             this.sessionId = sid;
-            log.info("[MCP] Conexão estabelecida com sucesso!");
+            log.info("[MCP] Conexão estabelecida! Session: {}", sid);
         }
     }
 
@@ -88,7 +97,21 @@ public class McpBrasilClient {
         ResponseEntity<String> resp = restTemplate.postForEntity(mcpUrl,
                 new HttpEntity<>(mapper.writeValueAsString(req), baseHeaders(sessionId)), String.class);
 
-        return parseSseOrJson(resp.getBody());
+        JsonNode result = parseSseOrJson(resp.getBody());
+
+        // Se sessão expirou, reseta e tenta uma vez mais
+        if (result.path("error").path("code").asInt(0) == -32600
+                || result.path("error").path("message").asText("").contains("session")) {
+            log.warn("[MCP] Sessão expirada. Reconectando...");
+            resetSession();
+            ensureSession();
+            req = buildRpc(idCounter.getAndIncrement(), method, params);
+            resp = restTemplate.postForEntity(mcpUrl,
+                    new HttpEntity<>(mapper.writeValueAsString(req), baseHeaders(sessionId)), String.class);
+            result = parseSseOrJson(resp.getBody());
+        }
+
+        return result;
     }
 
     private JsonNode parseSseOrJson(String raw) throws Exception {
@@ -121,11 +144,5 @@ public class McpBrasilClient {
         h.set(HttpHeaders.ACCEPT, "application/json, text/event-stream");
         if (sid != null) h.set("mcp-session-id", sid);
         return h;
-    }
-
-
-    public String listTools() throws Exception {
-        JsonNode response = sendRequest("tools/list", mapper.createObjectNode());
-        return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(response);
     }
 }

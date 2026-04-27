@@ -1,14 +1,15 @@
 package tfs.com.govtrace.api.services;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import tfs.com.govtrace.api.models.Despesa;
+import tfs.com.govtrace.api.models.Emenda;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
+import tfs.com.govtrace.api.repositories.EmendaRepository;
 
 import java.util.HashMap;
 import java.util.List;
@@ -21,171 +22,167 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class AuditoriaService {
 
-    private final GovTraceAuditor auditorIA;
+    private final IAuditorAgente auditorIA;
     private final DespesaRepository repository;
+    private final EmendaRepository emendaRepository;
     private final McpBrasilClient mcpClient;
-    private final ObjectMapper mapper = new ObjectMapper();
     private final KafkaTemplate<String, String> kafkaTemplate;
 
-    // --- PRODUCER: Envia as solicitações para o tópico ---
-    public void solicitarCargaAnual(String municipio, int ano) {
-        log.info("[Kafka] Criando eventos de carga para {}/{}", municipio, ano);
-        for (int m = 1; m <= 12; m++) {
-            String payload = String.format("%s;%d;%d", municipio, ano, m);
-            kafkaTemplate.send("fila-carga-tce", payload);
+    // =====================================================
+    // 1. CARGA DE DADOS (KAFKA PRODUCER)
+    // =====================================================
+    public void solicitarCarga(String municipio, int anoInicio, int anoFim) {
+        int totalMensagens = 0;
+        for (int ano = anoInicio; ano <= anoFim; ano++) {
+            for (int mes = 1; mes <= 12; mes++) {
+                // HACK: Enviamos 5 chamadas por mês com offsets para tentar burlar o limite de 30
+                for (int p = 1; p <= 5; p++) {
+                    String payload = String.format("%s;%d;%d;%d", municipio, ano, mes, p);
+                    kafkaTemplate.send("fila-carga-tce", payload);
+                    totalMensagens++;
+                }
+            }
         }
+        log.info("[Kafka] Carga enfileirada: {} mensagens para {} | {} a {}",
+                totalMensagens, municipio, anoInicio, anoFim);
     }
 
-    // --- CONSUMER: Processa cada mês conforme a fila anda ---
-    @KafkaListener(topics = "fila-carga-tce", groupId = "govtrace-group")
+    // =====================================================
+    // 2. PROCESSAMENTO (KAFKA CONSUMER)
+    // =====================================================
+    @KafkaListener(topics = "fila-carga-tce", groupId = "govtrace-carga-v1")
     public void processarMensagemCarga(String payload) {
         String[] dados = payload.split(";");
+        if (dados.length < 4) return;
+
         String municipio = dados[0];
         int ano = Integer.parseInt(dados[1]);
         int mes = Integer.parseInt(dados[2]);
+        int pagina = Integer.parseInt(dados[3]);
+        String dataPadrao = String.format("%d-%02d-01", ano, mes);
 
-        log.info("[Kafka Consumer] Processando Mês: {}/{}", mes, ano);
+        mcpClient.resetSession();
 
         try {
-            String jsonRaw = mcpClient.callTool(
-                    "tce_sp_consultar_despesas_sp",
-                    Map.of("municipio", municipio, "exercicio", ano, "mes", mes)
-            );
+            Map<String, Object> args = new HashMap<>();
+            args.put("municipio", municipio);
+            args.put("exercicio", ano);
+            args.put("mes", mes);
+            args.put("pagina", pagina);
+            args.put("offset", (pagina - 1) * 30);
 
-            int salvos = mapearESalvar(jsonRaw, municipio);
-            log.info("[Kafka Consumer] Mês {} finalizado. Registros novos: {}", mes, salvos);
+            String texto = mcpClient.callTool("tce_sp_consultar_despesas_sp", args);
+            int salvos = parsear(texto, municipio, dataPadrao);
 
-            Thread.sleep(800);
+            log.info("[Carga] {}/{}/{} Pág {}: {} novos. Total banco: {}",
+                    municipio, mes, ano, pagina, salvos, repository.count());
+
         } catch (Exception e) {
-            log.error("[Kafka Consumer] Erro ao processar {}/{}: {}", mes, ano, e.getMessage());
+            log.error("[Kafka] Erro na carga: {}", e.getMessage());
         }
     }
 
-    private int mapearESalvar(String jsonRaw, String municipio) {
+    // =====================================================
+    // 3. PARSER (REGEX CORRIGIDO)
+    // =====================================================
+    private int parsear(String texto, String municipio, String dataPadrao) {
         int count = 0;
-        if (jsonRaw != null && jsonRaw.contains("{")) {
-            try {
-                String jsonLimpo = jsonRaw.substring(jsonRaw.indexOf("{"));
-                JsonNode root = mapper.readTree(jsonLimpo);
-                JsonNode items = root.path("result").path("structuredContent").path("result");
-
-                if (items.isArray() && !items.isEmpty()) {
-                    for (JsonNode node : items) {
-                        if (salvarDespesa(node, municipio)) count++;
-                    }
-                    return count;
-                }
-            } catch (Exception e) {
-                log.warn("[Carga] Falha no JSON estruturado, tentando Regex fallback...");
-            }
-        }
-        return extrairViaRegex(jsonRaw, municipio);
-    }
-
-    private int extrairViaRegex(String text, String municipio) {
-        int count = 0;
-        Pattern pattern = Pattern.compile("- \\[(.*?)\\] (.*?): R\\$ (.*?) \\(empenho (.*?)\\)");
-        Matcher matcher = pattern.matcher(text);
+        // Regex focado em capturar o Favorecido, Valor e Empenho, ignorando o status entre colchetes
+        Pattern pattern = Pattern.compile(
+                "-\\s+\\[.*?\\]\\s+(.*?):\\s+R\\$\\s+([\\d.,]+)\\s+\\(empenho\\s+(.*?)\\)"
+        );
+        Matcher matcher = pattern.matcher(texto);
 
         while (matcher.find()) {
-            try {
-                String empenho = matcher.group(4).trim();
-                if (!repository.existsByDocumentoOrigem(empenho)) {
-                    Despesa d = Despesa.builder()
-                            .municipio(municipio)
-                            .nomeFavorecido(matcher.group(2).trim())
-                            .valorPago(matcher.group(3).trim())
-                            .documentoOrigem(empenho)
-                            .dataPagamento("2024-01-01")
-                            .build();
-                    repository.save(d);
-                    count++;
-                }
-            } catch (Exception e) {
-                log.debug("Linha ignorada no Regex.");
+            String favorecido = matcher.group(1).trim();
+            String valor      = matcher.group(2).trim();
+            String empenho    = matcher.group(3).trim();
+
+            if (empenho.isBlank()) continue;
+
+            if (!repository.existsByDocumentoOrigem(empenho)) {
+                repository.save(Despesa.builder()
+                        .municipio(municipio)
+                        .nomeFavorecido(favorecido)
+                        .valorPago(valor)
+                        .dataPagamento(dataPadrao)
+                        .documentoOrigem(empenho)
+                        .build());
+                count++;
             }
         }
         return count;
     }
 
-    private boolean salvarDespesa(JsonNode node, String municipio) {
-        String empenho = node.path("empenho").asText(node.path("documento").asText(""));
-        if (empenho.isBlank() || repository.existsByDocumentoOrigem(empenho)) return false;
-
-        Despesa d = Despesa.builder()
-                .municipio(municipio)
-                .nomeFavorecido(node.path("favorecido").asText("N/A"))
-                .valorPago(node.path("valor").asText("0,00"))
-                .documentoOrigem(empenho)
-                .dataPagamento(node.path("data").asText("2024-01-01"))
-                .build();
-        repository.save(d);
-        return true;
-    }
-
-    // --- AUDITORIA IA ---
-    public void analisarBaseComIA() {
-        List<Despesa> pendentes = repository.findPendentesDeAuditoria()
-                .stream().limit(15).toList();
-
-        if (pendentes.isEmpty()) return;
-
-        for (Despesa despesa : pendentes) {
-            try {
-                Thread.sleep(3000);
-                String context = String.format("Cidade: %s | Favorecido: %s | Valor: R$ %s | Doc: %s",
-                        despesa.getMunicipio(), despesa.getNomeFavorecido(),
-                        despesa.getValorPago(), despesa.getDocumentoOrigem());
-
-                String veredito = auditorIA.analisarGasto(context);
-                despesa.setVereditoIA(veredito);
-                despesa.setScoreRisco(extrairScore(veredito));
-                repository.save(despesa);
-            } catch (Exception e) {
-                if (e.getMessage() != null && e.getMessage().contains("429")) break;
+    // =====================================================
+    // 4. CRUZAMENTO DE DADOS
+    // =====================================================
+    @Transactional
+    public void realizarCruzamentoEmendas() {
+        log.info("[Auditoria] Iniciando cruzamento...");
+        List<Despesa> despesas = repository.findAll();
+        List<Emenda> emendas   = emendaRepository.findAll();
+        for (Despesa d : despesas) {
+            for (Emenda e : emendas) {
+                if (d.getNomeFavorecido() != null &&
+                        d.getNomeFavorecido().toUpperCase().contains(e.getAutor().toUpperCase())) {
+                    d.setEmenda(e);
+                    repository.save(d);
+                }
             }
         }
     }
 
+    // =====================================================
+    // 5. ANÁLISE IA (GROQ/OLLAMA)
+    // =====================================================
+    public void analisarBaseComIA() {
+        List<Despesa> pendentes = repository.findPendentesDeAuditoria()
+                .stream().limit(100).toList();
+
+        for (Despesa d : pendentes) {
+            try {
+                String veredito = auditorIA.analisar(sanitizarDados(d));
+                d.setVereditoIA(veredito);
+                d.setScoreRisco(extrairScore(veredito));
+                repository.save(d);
+                Thread.sleep(1500);
+            } catch (Exception e) {
+                log.error("[IA] Erro no registro {}: {}", d.getDocumentoOrigem(), e.getMessage());
+            }
+        }
+    }
+
+    private String sanitizarDados(Despesa d) {
+        String nome = d.getNomeFavorecido() != null ? d.getNomeFavorecido() : "N/A";
+        String nomeMascarado = nome.length() > 20 ? nome.substring(0, 15) + "..." : nome;
+        return String.format("Favorecido: %s | Valor: %s | Município: %s | Doc: %s",
+                nomeMascarado, d.getValorPago(), d.getMunicipio(), d.getDocumentoOrigem());
+    }
+
     private Integer extrairScore(String analise) {
         if (analise == null) return 50;
-        String t = analise.toUpperCase();
-        if (t.contains("CRÍTICO")) return 95;
-        if (t.contains("ALTO RISCO")) return 85;
-        if (t.contains("SUSPEITO")) return 70;
-        if (t.contains("ATENÇÃO")) return 55;
-        return 15;
+        String u = analise.toUpperCase();
+        if (u.contains("CRÍTICO") || u.contains("CRITICO")) return 95;
+        if (u.contains("ALTO RISCO")) return 85;
+        if (u.contains("SUSPEITO")) return 60;
+        if (u.contains("ATENÇÃO") || u.contains("ATENCAO")) return 40;
+        return 20;
     }
 
-    // --- NOVAS FUNCIONALIDADES PARA DASHBOARD E EMENDAS ---
-
-    /**
-     * Gera estatísticas consolidadas para os gráficos do Front-End.
-     */
+    // =====================================================
+    // 6. DASHBOARD
+    // =====================================================
     public Map<String, Object> obterEstatisticasDashboard() {
         List<Despesa> todas = repository.findAll();
-
-        long criticos = todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() >= 80).count();
-        long suspeitos = todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() >= 50 && d.getScoreRisco() < 80).count();
-        long regulares = todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() < 50).count();
-        long pendentes = todas.stream().filter(d -> d.getVereditoIA() == null).count();
-
         Map<String, Object> stats = new HashMap<>();
-        stats.put("totalProcessado", todas.size());
-        stats.put("criticos", criticos);
-        stats.put("suspeitos", suspeitos);
-        stats.put("regulares", regulares);
-        stats.put("aguardandoIA", pendentes);
-
+        stats.put("total_registros", todas.size());
+        stats.put("total_valor", todas.stream().mapToDouble(d -> {
+            try { return Double.parseDouble(d.getValorPago().replace(".", "").replace(",", ".")); }
+            catch (Exception e) { return 0.0; }
+        }).sum());
+        stats.put("criticos", todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() >= 80).count());
+        stats.put("suspeitos", todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() >= 50 && d.getScoreRisco() < 80).count());
         return stats;
-    }
-
-    /**
-     * Tenta vincular despesas existentes a emendas parlamentares pelo nome do favorecido.
-     * Útil para detectar desvios em verbas carimbadas.
-     */
-    public void realizarCruzamentoEmendas() {
-        log.info("[Auditoria] Iniciando cruzamento de dados Despesas x Emendas...");
-        // Futura implementação: Repositorio de Emendas parlamentares
     }
 }
