@@ -3,6 +3,7 @@ package tfs.com.govtrace.api.models;
 import jakarta.persistence.*;
 import lombok.*;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import java.math.BigDecimal;
 
 @Entity
 @Table(name = "tb_despesas")
@@ -30,7 +31,8 @@ public class Despesa {
     private String cnpjFavorecido;
 
     @JsonProperty("valorPago")
-    private String valorPago;
+    @Column(precision = 15, scale = 2) // Fundamental para o MySQL entender que é DINHEIRO ENZO DINHEIRO NAO TEXTOO
+    private BigDecimal valorPago;
 
     @JsonProperty("dataPagamento")
     private String dataPagamento;

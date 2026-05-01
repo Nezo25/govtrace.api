@@ -3,6 +3,7 @@ package tfs.com.govtrace.api.models;
 import jakarta.persistence.*;
 import lombok.*;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import java.math.BigDecimal;
 
 @Entity
 @Table(name = "tb_emendas")
@@ -43,8 +44,11 @@ public class Emenda {
     private String subfuncao;
 
     @JsonProperty("valorEmpenhado")
-    private String valorEmpenhado; // Recebemos String devido à formatação brasileira (vírgula)
+    @Column(precision = 15, scale = 2)
+    private BigDecimal valorEmpenhado;
 
     @JsonProperty("valorPago")
-    private String valorPago;
+    @Column(precision = 15, scale = 2)
+    private BigDecimal valorPago;
+
 }

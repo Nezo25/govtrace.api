@@ -9,11 +9,10 @@ import org.springframework.stereotype.Service;
 import tfs.com.govtrace.api.models.Despesa;
 import tfs.com.govtrace.api.repositories.DespesaRepository;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Orquestrador de Inteligência e Dados da Three Frog System (TFS).
@@ -70,7 +69,7 @@ public class AuditoriaService {
 
     private int mapearESalvar(String jsonRaw, String municipio) {
         int count = 0;
-        // Tenta parsear como JSON estruturado primeiro
+        // Tenta parsear como JSON estruturado apenas
         if (jsonRaw != null && jsonRaw.contains("{")) {
             try {
                 String jsonLimpo = jsonRaw.substring(jsonRaw.indexOf("{"));
@@ -84,55 +83,50 @@ public class AuditoriaService {
                     return count;
                 }
             } catch (Exception e) {
-                log.warn("[Carga] Formato JSON não estruturado, recorrendo ao Regex.");
+                log.warn("[Carga Task] Formato JSON não estruturado recebido do MCP. A carga deste lote foi ignorada.");
             }
+        } else {
+            log.warn("[Carga Task] Retorno vazio ou sem JSON do MCP.");
         }
-        // Fallback para Regex (limpeza de Markdown/Asteriscos)
-        return extrairViaRegex(jsonRaw, municipio);
-    }
 
-    private int extrairViaRegex(String text, String municipio) {
-        int count = 0;
-        Pattern pattern = Pattern.compile("- \\[(.*?)\\] (.*?): R\\$ (.*?) \\(empenho (.*?)\\)");
-        Matcher matcher = pattern.matcher(text);
-
-        while (matcher.find()) {
-            try {
-                String empenho = matcher.group(4).trim();
-                if (!repository.existsByDocumentoOrigem(empenho)) {
-                    Despesa d = Despesa.builder()
-                            .municipio(municipio)
-                            .nomeFavorecido(matcher.group(2).trim())
-                            .valorPago(matcher.group(3).trim())
-                            .documentoOrigem(empenho)
-                            .dataPagamento("2024-01-01") // Placeholder para análise de competência
-                            .build();
-                    repository.save(d);
-                    count++;
-                }
-            } catch (Exception e) {
-                log.debug("Linha Regex inválida ignorada.");
-            }
-        }
+        // Fim da Era Regex: Se não é JSON estruturado, a gente não suja o banco.
         return count;
     }
 
     private boolean salvarDespesa(JsonNode node, String municipio) {
         String empenho = node.path("empenho").asText(node.path("documento").asText(""));
-        if (empenho.isBlank() || repository.existsByDocumentoOrigem(empenho)) return false;
 
+        // Evita duplicidade e garante que tem ID de origem
+        if (empenho.isBlank() || repository.existsByDocumentoOrigem(empenho)) {
+            return false;
+        }
+
+        // 1. Extração segura de valores para BigDecimal
+        String valorStr = node.path("valor").asText("0,00");
+        BigDecimal valorConvertido;
+        try {
+            valorConvertido = new BigDecimal(valorStr.replace(".", "").replace(",", "."));
+        } catch (NumberFormatException e) {
+            log.debug("[Carga Task] Valor inválido recebido '{}'. Convertendo para 0.", valorStr);
+            valorConvertido = BigDecimal.ZERO;
+        }
+
+        // 2. Montagem do objeto tipado
         Despesa d = Despesa.builder()
                 .municipio(municipio)
                 .nomeFavorecido(node.path("favorecido").asText("N/A"))
-                .valorPago(node.path("valor").asText("0,00"))
+                .valorPago(valorConvertido)
                 .documentoOrigem(empenho)
                 .dataPagamento(node.path("data").asText("2024-01-01"))
                 .build();
+
         repository.save(d);
         return true;
     }
 
     // ── AUDITORIA COM IA (GROQ) ──────────────────────────────────────────
+    // NOTA: Esta parte sofrerá refatoração pesada na Fase 3 e 4.
+    // Por enquanto, ela se mantém funcionando para não quebrar a compilação.
 
     /**
      * Auditoria assíncrona. Dispara as análises sem bloquear a aplicação.
@@ -156,7 +150,8 @@ public class AuditoriaService {
 
                 String context = String.format("Cidade: %s | Favorecido: %s | Valor: R$ %s | Doc: %s",
                         despesa.getMunicipio(), despesa.getNomeFavorecido(),
-                        despesa.getValorPago(), despesa.getDocumentoOrigem());
+                        despesa.getValorPago().toString(), // Atualizado para chamar .toString() do BigDecimal
+                        despesa.getDocumentoOrigem());
 
                 String veredito = auditorIA.analisarGasto(context);
                 despesa.setVereditoIA(veredito);
