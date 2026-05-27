@@ -17,34 +17,50 @@ public class Despesa {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @Column(name = "municipio")
     private String municipio;
 
     @JsonProperty("codigoEmenda")
+    @Column(name = "codigo_emenda")
     private String codigoEmenda;
 
     @JsonProperty("nomeFavorecido")
+    @Column(name = "nome_favorecido")
     private String nomeFavorecido;
 
     @JsonProperty("cnpjFavorecido")
-    @Column(length = 50)
+    @Column(name = "cnpj_favorecido", length = 50)
     private String cnpjFavorecido;
 
     @JsonProperty("valorPago")
+    @Column(name = "valor_pago")
     private String valorPago;
 
     @JsonProperty("dataPagamento")
+    @Column(name = "data_pagamento")
     private String dataPagamento;
 
     @JsonProperty("documentoOrigem")
-    @Column(unique = true)
+    @Column(name = "documento_origem", unique = true)
     private String documentoOrigem;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "emenda_id")
     private Emenda emenda;
 
-    @Column(columnDefinition = "TEXT")
+
+    @Column(name = "veredito_ia", columnDefinition = "TEXT")
     private String vereditoIA;
 
+    @Column(name = "score_risco")
     private Integer scoreRisco;
+
+    @Column(name = "categoria")
+    private String categoria;
+
+    @Column(name = "metodo_cruzamento")
+    private String metodoCruzamento;
+
+    @Column(name = "nexo_causal_confirmado")
+    private boolean nexoCausalConfirmado = false;
 }
