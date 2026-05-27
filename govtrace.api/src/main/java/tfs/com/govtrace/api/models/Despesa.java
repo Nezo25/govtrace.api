@@ -54,4 +54,13 @@ public class Despesa {
 
     @Column(name = "score_risco")
     private Integer scoreRisco;
+
+    @Column(name = "categoria")
+    private String categoria;
+
+    @Column(name = "metodo_cruzamento")
+    private String metodoCruzamento;
+
+    @Column(name = "nexo_causal_confirmado")
+    private boolean nexoCausalConfirmado = false;
 }

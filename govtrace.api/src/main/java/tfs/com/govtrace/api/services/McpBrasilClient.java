@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
@@ -17,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class McpBrasilClient {
 
     private final ObjectMapper mapper = new ObjectMapper();
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate;
     private final AtomicInteger idCounter = new AtomicInteger(1);
 
     @Value("${govtrace.mcp.url:http://localhost:8000/mcp}")
@@ -26,10 +27,17 @@ public class McpBrasilClient {
     private volatile String sessionId = null;
     private final Object sessionLock = new Object();
 
-    /**
-     * Reseta a sessão forçando novo handshake na próxima chamada.
-     * Necessário quando o MCP expira a sessão entre mensagens do Kafka.
-     */
+    public McpBrasilClient(
+            @Value("${govtrace.mcp.connect-timeout-ms:15000}") int connectTimeoutMs,
+            @Value("${govtrace.mcp.read-timeout-ms:1800000}") int readTimeoutMs) {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(connectTimeoutMs);
+        factory.setReadTimeout(readTimeoutMs);
+        this.restTemplate = new RestTemplate(factory);
+        log.info("[MCP] Cliente HTTP | connect={}ms | read={}ms (~{} min)",
+                connectTimeoutMs, readTimeoutMs, readTimeoutMs / 60_000);
+    }
+
     public void resetSession() {
         synchronized (sessionLock) {
             log.info("[MCP] Resetando sessão...");
@@ -38,6 +46,9 @@ public class McpBrasilClient {
     }
 
     public String callTool(String toolName, Map<String, Object> arguments) throws Exception {
+        long inicio = System.currentTimeMillis();
+        log.info("[MCP] Chamando tool '{}' (aguarde — carga grande pode levar vários minutos)...", toolName);
+
         ObjectNode toolParams = mapper.createObjectNode();
         toolParams.put("name", toolName);
         toolParams.set("arguments", mapper.valueToTree(arguments));
@@ -45,14 +56,21 @@ public class McpBrasilClient {
         JsonNode response = sendRequest("tools/call", toolParams);
 
         if (response.has("error")) {
-            throw new RuntimeException("Erro MCP: " + response.path("error").path("message").asText());
+            String msg = response.path("error").path("message").asText("erro desconhecido");
+            throw new RuntimeException("Erro MCP: " + msg);
         }
 
         JsonNode content = response.path("result").path("content");
+        String texto;
         if (content.isArray() && !content.isEmpty()) {
-            return content.get(0).path("text").asText();
+            texto = content.get(0).path("text").asText();
+        } else {
+            texto = "[]";
         }
-        return "[]";
+
+        log.info("[MCP] Tool '{}' OK em {}s | resposta: {} caracteres",
+                toolName, (System.currentTimeMillis() - inicio) / 1000, texto.length());
+        return texto;
     }
 
     private void ensureSession() throws Exception {
@@ -99,7 +117,6 @@ public class McpBrasilClient {
 
         JsonNode result = parseSseOrJson(resp.getBody());
 
-        // Se sessão expirou, reseta e tenta uma vez mais
         if (result.path("error").path("code").asInt(0) == -32600
                 || result.path("error").path("message").asText("").contains("session")) {
             log.warn("[MCP] Sessão expirada. Reconectando...");
@@ -123,7 +140,8 @@ public class McpBrasilClient {
                 try {
                     JsonNode n = mapper.readTree(jsonPart);
                     if (n.has("id") || n.has("result")) lastNode = n;
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
             }
         }
         return lastNode != null ? lastNode : mapper.readTree(raw);

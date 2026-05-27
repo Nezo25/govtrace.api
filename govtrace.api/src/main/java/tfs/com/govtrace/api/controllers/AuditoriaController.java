@@ -5,9 +5,9 @@ import com.fasterxml.jackson.dataformat.csv.CsvMapper;
 import com.fasterxml.jackson.dataformat.csv.CsvSchema;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import jakarta.servlet.http.HttpServletResponse;
-import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import tfs.com.govtrace.api.models.Despesa;
@@ -21,7 +21,7 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.concurrent.CompletableFuture;
 
 @RestController
 @RequestMapping("/api/auditoria")
@@ -34,17 +34,12 @@ public class AuditoriaController {
     private final TransporteRepository transporteRepository;
     private final AuditoriaService auditoriaService;
 
-    /**
-     * CARGA DE DADOS — flexível por cidade + intervalo de anos.
-     *
-     * Exemplos:
-     *   POST /api/auditoria/carga-dados?cidade=braganca-paulista&anoInicio=2024&anoFim=2024
-     *   POST /api/auditoria/carga-dados?cidade=campinas&anoInicio=2022&anoFim=2024
-     *
-     * Se anoFim não for informado, usa o mesmo valor de anoInicio (só um ano).
-     */
-    @PostMapping("/carga-dados")
-    public ResponseEntity<String> carregarDados(
+    // =====================================================
+    // 1. ENDPOINTS DE CARGA E INGESTÃO DE DADOS
+    // =====================================================
+
+    @PostMapping("/carga-despesas")
+    public ResponseEntity<String> carregarDespesas(
             @RequestParam(defaultValue = "braganca-paulista") String cidade,
             @RequestParam(defaultValue = "2024") int anoInicio,
             @RequestParam(required = false) Integer anoFim) {
@@ -52,21 +47,16 @@ public class AuditoriaController {
         int fim = (anoFim != null) ? anoFim : anoInicio;
 
         if (fim < anoInicio) {
-            return ResponseEntity.badRequest()
-                    .body("anoFim não pode ser menor que anoInicio.");
+            return ResponseEntity.badRequest().body("anoFim não pode ser menor que anoInicio.");
         }
 
-        int totalMeses = (fim - anoInicio + 1) * 12;
         auditoriaService.solicitarCarga(cidade, anoInicio, fim);
-
-        return ResponseEntity.accepted().body(String.format(
-                "Carga iniciada para %s | %d → %d | %d mensagens enfileiradas.",
-                cidade, anoInicio, fim, totalMeses));
+        return ResponseEntity.accepted().body("Carga de despesas municipais enfileirada com sucesso via Kafka.");
     }
 
     @PostMapping("/upload-transporte")
     public ResponseEntity<String> uploadTransporte(@RequestParam("arquivo") MultipartFile file) {
-        if (file.isEmpty()) return ResponseEntity.badRequest().body("Arquivo vazio.");
+        if (file.isEmpty()) return ResponseEntity.badRequest().body("Arquivo CSV vazio.");
         try {
             CsvMapper mapper = new CsvMapper();
             mapper.registerModule(new JavaTimeModule());
@@ -75,16 +65,35 @@ public class AuditoriaController {
                     .with(schema).readValues(file.getInputStream());
             List<TransporteAuditoria> dados = it.readAll();
             transporteRepository.saveAll(dados);
-            return ResponseEntity.ok("Sucesso! " + dados.size() + " registros importados.");
+            return ResponseEntity.ok("Sucesso! " + dados.size() + " registros de transporte importados.");
         } catch (Exception e) {
-            return ResponseEntity.internalServerError().body("Erro: " + e.getMessage());
+            return ResponseEntity.internalServerError().body("Erro ao processar CSV: " + e.getMessage());
         }
+    }
+
+    // =====================================================
+    // 2. ENDPOINTS DE PROCESSAMENTO E CRITICIDADE
+    // =====================================================
+
+    @PostMapping("/cruzar-emendas")
+    public ResponseEntity<String> dispararCruzamento() {
+        CompletableFuture.runAsync(auditoriaService::realizarCruzamentoEmendas);
+        return ResponseEntity.accepted().body("Algoritmo de batimento de nexo causal iniciado em segundo plano.");
     }
 
     @PostMapping("/disparar-analise")
     public ResponseEntity<String> dispararAnalise() {
-        auditoriaService.analisarBaseComIA();
-        return ResponseEntity.ok("Análise por IA iniciada.");
+        CompletableFuture.runAsync(auditoriaService::analisarBaseComIA);
+        return ResponseEntity.accepted().body("Auditoria complementar via IA disparada em segundo plano.");
+    }
+
+    // =====================================================
+    // 3. ENDPOINTS DE LEITURA (DASHBOARD E CONSULTAS)
+    // =====================================================
+
+    @GetMapping("/dashboard")
+    public ResponseEntity<Map<String, Object>> getDashboard() {
+        return ResponseEntity.ok(auditoriaService.obterEstatisticasDashboard());
     }
 
     @GetMapping("/ranking-risco")
@@ -97,10 +106,14 @@ public class AuditoriaController {
         return ResponseEntity.ok(despesaRepository.findPendentesDeAuditoria());
     }
 
-    @GetMapping("/dashboard")
-    public ResponseEntity<Map<String, Object>> getDashboard() {
-        return ResponseEntity.ok(auditoriaService.obterEstatisticasDashboard());
+    @GetMapping("/casos-criticos")
+    public ResponseEntity<List<Despesa>> getCasosCriticos(@RequestParam(defaultValue = "80") int threshold) {
+        return ResponseEntity.ok(despesaRepository.findCasosCriticos(threshold));
     }
+
+    // =====================================================
+    // 4. UTILITÁRIOS (RESET E EXPORTAÇÃO)
+    // =====================================================
 
     @DeleteMapping("/limpar")
     @Transactional
@@ -109,24 +122,30 @@ public class AuditoriaController {
             despesaRepository.deleteAll();
             emendaRepository.deleteAll();
             transporteRepository.deleteAll();
-            return ResponseEntity.ok("Base resetada com sucesso.");
+            return ResponseEntity.ok("Base de dados totalmente limpa e resetada para testes.");
         } catch (Exception e) {
-            return ResponseEntity.internalServerError().body("Erro: " + e.getMessage());
+            return ResponseEntity.internalServerError().body("Erro ao resetar tabelas: " + e.getMessage());
         }
     }
 
     @GetMapping("/exportar-auditoria")
     public void exportarRelatorio(HttpServletResponse response) throws IOException {
         response.setContentType("text/csv");
+        response.setCharacterEncoding("UTF-8");
         response.setHeader("Content-Disposition", "attachment; filename=auditoria_govtrace.csv");
+
         PrintWriter writer = response.getWriter();
-        writer.println("Documento;Favorecido;Valor;Risco;Veredito_IA");
+        writer.println("Documento;Favorecido;Valor;Categoria;Risco;Veredito_IA");
+
         despesaRepository.findAllByOrderByScoreRiscoDesc().forEach(d -> {
             String nome = d.getNomeFavorecido() != null ? d.getNomeFavorecido() : "";
-            String nomeMascarado = nome.length() > 15 ? nome.substring(0, 12) + "..." : nome;
-            writer.println(String.format("%s;%s;%s;%s;%s",
+            String nomeMascarado = nome.length() > 20 ? nome.substring(0, 17) + "..." : nome;
+            String cat = d.getCategoria() != null ? d.getCategoria() : "N/A";
+            String veredito = d.getVereditoIA() != null ? d.getVereditoIA().replace("\n", " ") : "Sem análise";
+
+            writer.println(String.format("%s;%s;%s;%s;%s;%s",
                     d.getDocumentoOrigem(), nomeMascarado, d.getValorPago(),
-                    d.getScoreRisco(), d.getVereditoIA()));
+                    cat, d.getScoreRisco() != null ? d.getScoreRisco() : "0", veredito));
         });
     }
 }

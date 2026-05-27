@@ -1,4 +1,0 @@
-placaVeiculo,modelo,dataAbastecimento,litros,valorTotal,kmAtual,combustivel
-ABC-1234,Ambulância Master,2024-03-10,50.0,300.00,150200,DIESEL
-DEF-5678,Ambulância Sprinter,2024-03-11,45.0,270.00,85400,DIESEL
-GHI-9012,Ambulância Renault,2024-03-12,60.0,360.00,120100,DIESEL

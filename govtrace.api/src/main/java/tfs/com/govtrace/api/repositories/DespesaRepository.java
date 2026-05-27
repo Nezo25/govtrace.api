@@ -23,4 +23,8 @@ public interface DespesaRepository extends JpaRepository<Despesa, Long> {
     /** Pendentes de auditoria pela IA. */
     @Query("SELECT d FROM Despesa d WHERE d.vereditoIA IS NULL OR d.vereditoIA = ''")
     List<Despesa> findPendentesDeAuditoria();
+
+    /** Pendentes de cruzamento de emendas e despesas */
+    @Query("SELECT d FROM Despesa d WHERE d.emenda IS NULL")
+    List<Despesa> findDespesasSemEmenda();
 }
