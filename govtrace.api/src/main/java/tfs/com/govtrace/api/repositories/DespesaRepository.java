@@ -1,6 +1,7 @@
 package tfs.com.govtrace.api.repositories;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.stereotype.Repository;
 import tfs.com.govtrace.api.models.Despesa;
@@ -27,4 +28,7 @@ public interface DespesaRepository extends JpaRepository<Despesa, Long> {
     /** Pendentes de cruzamento de emendas e despesas */
     @Query("SELECT d FROM Despesa d WHERE d.emenda IS NULL")
     List<Despesa> findDespesasSemEmenda();
+    @Modifying
+    @Query("UPDATE Despesa d SET d.emenda = null, d.nexoCausalConfirmado = false, d.metodoCruzamento = null, d.vereditoIA = null, d.scoreRisco = null")
+    int resetarCruzamentos();
 }

@@ -1,6 +1,7 @@
 package tfs.com.govtrace.api.repositories;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.stereotype.Repository;
 import tfs.com.govtrace.api.models.Emenda;
@@ -50,4 +51,7 @@ public interface EmendaRepository extends JpaRepository<Emenda, Long> {
 
     @Query("SELECT e FROM Emenda e WHERE e.vereditoIA IS NULL OR e.vereditoIA = ''")
     List<Emenda> findPendentesDeAuditoria();
+    @Modifying
+    @Query("UPDATE Emenda e SET e.vereditoIA = null, e.scoreRisco = null")
+    void resetarVereditos();
 }

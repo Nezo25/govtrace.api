@@ -1,7 +1,7 @@
 package tfs.com.govtrace.api.services;
 
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -21,18 +21,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
-/**
- * Responsável por:
- *   1. Enfileirar e processar carga de despesas TCE-SP via Kafka
- *   2. Cruzamento de nexo causal (despesas x emendas)
- *   3. Análise de risco via IA (Groq)
- *
- * Emendas são gerenciadas exclusivamente pelo EmendaService.
- */
 @Service
-@Slf4j
-@RequiredArgsConstructor
 public class AuditoriaService {
+
+    private static final Logger log = LoggerFactory.getLogger(AuditoriaService.class);
 
     private final IAuditorAgente auditorIA;
     private final DespesaRepository repository;
@@ -44,9 +36,16 @@ public class AuditoriaService {
     @Value("${govtrace.auditoria.lote-maximo:1200}")
     private int loteMaximoAuditoria;
 
-    // =====================================================
-    // 1. CARGA DE DESPESAS (KAFKA PRODUCER)
-    // =====================================================
+    public AuditoriaService(IAuditorAgente auditorIA, DespesaRepository repository,
+                            EmendaRepository emendaRepository, McpBrasilClient mcpClient,
+                            KafkaTemplate<String, String> kafkaTemplate, TransactionTemplate transactionTemplate) {
+        this.auditorIA = auditorIA;
+        this.repository = repository;
+        this.emendaRepository = emendaRepository;
+        this.mcpClient = mcpClient;
+        this.kafkaTemplate = kafkaTemplate;
+        this.transactionTemplate = transactionTemplate;
+    }
 
     public void solicitarCarga(String municipio, int anoInicio, int anoFim) {
         mcpClient.resetSession();
@@ -57,217 +56,175 @@ public class AuditoriaService {
                 total++;
             }
         }
-        log.info("[Kafka] {} mensagens enfileiradas: {} | {} → {}", total, municipio, anoInicio, anoFim);
+        log.info("[Kafka] {} mensagens enfileiradas.", total);
     }
-
-    // =====================================================
-    // 2. PROCESSAMENTO (KAFKA CONSUMER)
-    // =====================================================
 
     @KafkaListener(topics = "fila-carga-tce", groupId = "govtrace-carga-v3")
     public void processarMensagemCarga(String payload) {
         String[] dados = payload.split(";");
         if (dados.length < 3) return;
 
-        String municipio  = dados[0];
-        int ano           = Integer.parseInt(dados[1]);
-        int mes           = Integer.parseInt(dados[2]);
+        String municipio = dados[0];
+        int ano = Integer.parseInt(dados[1]);
+        int mes = Integer.parseInt(dados[2]);
         String dataPadrao = String.format("%d-%02d-01", ano, mes);
-
-        mcpClient.resetSession();
 
         try {
             Map<String, Object> args = new HashMap<>();
             args.put("municipio", municipio.toLowerCase().trim());
             args.put("exercicio", ano);
             args.put("mes", mes);
-
-            // HTTP fora da transação para evitar deadlock
             String texto = mcpClient.callTool("tce_sp_consultar_despesas_sp", args);
-
-            transactionTemplate.executeWithoutResult(status ->
-                    parsear(texto, municipio, dataPadrao));
-
+            transactionTemplate.executeWithoutResult(status -> parsear(texto, municipio, dataPadrao));
         } catch (Exception e) {
-            log.error("[Kafka] Erro {}/{}/{}: {}", municipio, mes, ano, e.getMessage());
+            log.error("[Kafka] Erro na carga: {}", e.getMessage());
         }
     }
 
-    // =====================================================
-    // 3. PARSER TCE-SP
-    // Formato: "- [Empenhado] FAVORECIDO: R$ VALOR (empenho NUMERO)"
-    // =====================================================
-
     private void parsear(String texto, String municipio, String data) {
-        Pattern pattern = Pattern.compile(
-                "(?i)-\\s+\\[.*?\\]\\s+(.*?):\\s+R\\$\\s+([\\d.,]+)\\s+\\(empenho\\s+(.*?)\\)"
-        );
+        if (texto == null || texto.isEmpty()) return;
+
+        Pattern pattern = Pattern.compile("(?i)-\\s+\\[.*?\\]\\s+(.*?):\\s+R\\$\\s+([\\d.,]+)\\s+\\(empenho\\s+(.*?)\\)");
         Matcher matcher = pattern.matcher(texto);
         List<Despesa> lote = new ArrayList<>();
 
         while (matcher.find()) {
-            String fav    = matcher.group(1).trim();
-            String valor  = matcher.group(2).trim();
+            String fav = matcher.group(1).trim();
+            String valor = matcher.group(2).trim();
             String empenho = matcher.group(3).trim();
 
             if (empenho.isBlank() || repository.existsByDocumentoOrigem(empenho)) continue;
 
-            lote.add(Despesa.builder()
-                    .municipio(municipio)
-                    .nomeFavorecido(fav)
-                    .valorPago(valor)
-                    .categoria(inferirCategoria(fav))
-                    .dataPagamento(data)
-                    .documentoOrigem(empenho)
-                    .nexoCausalConfirmado(false)
-                    .build());
+            String cnpjLimpo = null;
+
+            // 1. Tenta extrair a tag (ID: ...) caso a API um dia passe a enviar
+            if (fav.contains("(ID:")) {
+                int idx = fav.lastIndexOf("(ID:");
+                String idSujo = fav.substring(idx + 4, fav.lastIndexOf(")")).trim();
+                cnpjLimpo = limparCnpj(idSujo);
+                fav = fav.substring(0, idx).trim();
+            }
+
+            // 2. Extrai o CPF/CNPJ que já vem colado no nome do fornecedor (O que funcionou na sua Planilha 2!)
+            if (cnpjLimpo == null && fav.matches(".*\\s\\d{11,14}$")) {
+                Pattern docPattern = Pattern.compile("\\s(\\d{11,14})$");
+                Matcher docMatcher = docPattern.matcher(fav);
+                if (docMatcher.find()) {
+                    cnpjLimpo = docMatcher.group(1);
+                    fav = fav.replace(cnpjLimpo, "").trim(); // Limpa o nome para o banco
+                }
+            }
+
+            // 3. CAMADA DE ENRIQUECIMENTO (Master Fallback do TCC)
+            // Resolve o buraco de dados da API do TCE-SP mapeando os maiores recebedores
+            if (cnpjLimpo == null) {
+                String nomeUpper = fav.toUpperCase();
+                if (nomeUpper.contains("PREFEITURA") && nomeUpper.contains("BRAGANCA")) {
+                    cnpjLimpo = "46352746000165"; // CNPJ Prefeitura Bragança Paulista
+                } else if (nomeUpper.contains("CAIXA ECONOMICA") || nomeUpper.contains("CEF MATRIZ")) {
+                    cnpjLimpo = "00360305000104"; // CNPJ Caixa Econômica Federal
+                } else if (nomeUpper.contains("SEGURO SOCIAL") || nomeUpper.contains("INSS")) {
+                    cnpjLimpo = "29979036000140"; // CNPJ INSS
+                } else if (nomeUpper.contains("TRIBUNAL DE JUSTICA")) {
+                    cnpjLimpo = "51174001000193"; // CNPJ TJ-SP
+                } else if (nomeUpper.contains("SANEAMENTO") || nomeUpper.contains("SABESP")) {
+                    cnpjLimpo = "43776517000180"; // CNPJ SABESP
+                }
+            }
+
+            Despesa d = new Despesa();
+            d.setMunicipio(municipio.toUpperCase());
+            d.setNomeFavorecido(fav);
+            d.setCnpjFavorecido(cnpjLimpo); // Agora o CNPJ da prefeitura será preenchido!
+            d.setValorPago(valor);
+            d.setDataPagamento(data);
+            d.setDocumentoOrigem(empenho);
+            d.setNexoCausalConfirmado(false);
+            lote.add(d);
         }
 
         if (!lote.isEmpty()) {
             repository.saveAll(lote);
-            log.info("[Carga] {} registros salvos para {}.", lote.size(), data);
+            log.info("[Carga] {} despesas salvas no banco com sucesso.", lote.size());
         } else {
-            log.warn("[Carga] 0 registros para {}. Início do texto: {}",
-                    data, texto.substring(0, Math.min(150, texto.length())));
+            log.warn("[Carga] Nenhum registro encontrado para salvar. (Verifique o log do Python)");
         }
     }
-
-    /**
-     * Infere categoria pelo nome do favorecido.
-     * Será sobrescrita pelo cruzamento quando houver nexo causal confirmado.
-     */
-    private String inferirCategoria(String fav) {
-        String f = fav.toUpperCase();
-        if (f.contains("SAUDE") || f.contains("MEDIC") || f.contains("HOSPIT") || f.contains("FARMAC")) return "SAÚDE";
-        if (f.contains("EDUCA") || f.contains("ENSINO") || f.contains("ESCOLA") || f.contains("PROMOVE")) return "EDUCAÇÃO";
-        if (f.contains("TRANSPORT") || f.contains("COMBUSTIV") || f.contains("VIACO") || f.contains("ONIBUS")) return "TRANSPORTE";
-        if (f.contains("OBRA") || f.contains("CONSTRUC") || f.contains("SANEAM") || f.contains("SABESP")) return "INFRAESTRUTURA";
-        if (f.contains("ADVOGAD") || f.contains("TRIBUNAL") || f.contains("JUSTICA") || f.contains("PROCURAD")) return "LEGAL";
-        if (f.contains("PREFEITURA")) return "ADMINISTRAÇÃO";
-        return "OUTROS";
-    }
-
-    // =====================================================
-    // 4. CRUZAMENTO NEXO CAUSAL (despesas x emendas)
-    // =====================================================
 
     @Transactional
     public void realizarCruzamentoEmendas() {
-        log.info("[Cruzamento] Iniciando batimento nexo causal...");
+        log.info("[Auditoria] Iniciando batimento definitivo (JOIN Direto por CNPJ + Valor)...");
+
         List<Despesa> pendentes = repository.findDespesasSemEmenda();
-        List<Emenda> emendas    = emendaRepository.findAll();
+        List<Emenda> emendas = emendaRepository.findAll();
+        int totalVinculos = 0;
 
-        int matches = 0;
-        for (Despesa d : pendentes) {
-            String fav = d.getNomeFavorecido().toUpperCase();
-            String cat = d.getCategoria() != null ? d.getCategoria().toUpperCase() : "";
+        for (Emenda e : emendas) {
+            String cnpjEmenda = limparCnpj(e.getCodigoFavorecido());
+            double vEmenda = converterValor(e.getValorPago());
 
-            for (Emenda e : emendas) {
-                if (e.getAutor() == null) continue;
-                String autor  = e.getAutor().toUpperCase();
-                String funcao = e.getFuncao() != null ? e.getFuncao().toUpperCase() : "";
+            if (vEmenda < 1000 || cnpjEmenda == null || cnpjEmenda.isEmpty()) continue;
 
-                boolean autorMatch = fav.contains(autor);
-                boolean areaMatch  = cat.contains(funcao) || fav.contains(funcao);
+            for (Despesa d : pendentes) {
+                if (d.getEmenda() != null) continue;
 
-                if (autorMatch && areaMatch) {
-                    double vDespesa = converterValor(d.getValorPago());
-                    double vEmenda  = converterValor(e.getValorPago());
+                String cnpjDespesa = limparCnpj(d.getCnpjFavorecido());
+                double vDespesa = converterValor(d.getValorPago());
 
-                    if (vDespesa <= vEmenda + 0.01) {
-                        d.setEmenda(e);
-                        d.setNexoCausalConfirmado(true);
-                        d.setCategoria(funcao);
-                        d.setMetodoCruzamento("NEXO_AUTOR_VALOR");
-                        d.setVereditoIA("NEXO CONFIRMADO: vínculo por metadados.");
-                        repository.save(d);
-                        matches++;
-                        log.info("[MATCH] {} → emenda de {}", d.getDocumentoOrigem(), e.getAutor());
+                if (cnpjEmenda.equals(cnpjDespesa)) {
+                    boolean valorBate = (vDespesa >= vEmenda * 0.95 && vDespesa <= vEmenda * 1.05);
+
+                    d.setEmenda(e);
+                    d.setNexoCausalConfirmado(valorBate);
+                    d.setMetodoCruzamento("JOIN_DIRETO_CNPJ");
+
+                    if (valorBate) {
+                        d.setVereditoIA("HOMOLOGADO: CNPJ e Valores conferem perfeitamente.");
+                    } else {
+                        d.setVereditoIA("ALERTA: CNPJ confere, mas há divergência no montante repassado.");
                     }
+
+                    repository.save(d);
+                    totalVinculos++;
+                    log.info("[MATCH] Vínculo CNPJ: Emenda {} -> Documento {}", e.getCodigoEmenda(), d.getDocumentoOrigem());
                 }
             }
         }
-        log.info("[Cruzamento] Concluído: {} vínculos gerados.", matches);
-    }
-
-    // =====================================================
-    // 5. BALANCEAMENTO E ANÁLISE IA (50/50 despesas x emendas)
-    // =====================================================
-
-    public record LoteBalanceado(List<Despesa> despesas, List<Emenda> emendas, int limite) {}
-
-    /**
-     * Iguala despesas e emendas no mesmo lote: até {@code loteMaximoAuditoria} (padrão 1200)
-     * e nunca mais que o menor estoque disponível.
-     */
-    public LoteBalanceado balancearParaAuditoria(List<Despesa> despesas, List<Emenda> emendas) {
-        int limite = Math.min(loteMaximoAuditoria, Math.min(despesas.size(), emendas.size()));
-        if (limite <= 0) {
-            return new LoteBalanceado(List.of(), List.of(), 0);
-        }
-        List<Despesa> despesasBalanceadas = despesas.stream().limit(limite).toList();
-        List<Emenda> emendasBalanceadas = emendas.stream().limit(limite).toList();
-        return new LoteBalanceado(despesasBalanceadas, emendasBalanceadas, limite);
-    }
-
-    public LoteBalanceado obterLotePendenteBalanceado() {
-        return balancearParaAuditoria(
-                repository.findPendentesDeAuditoria(),
-                emendaRepository.findPendentesDeAuditoria());
+        log.info("[Auditoria] Auditoria finalizada. {} vínculos exatos encontrados.", totalVinculos);
     }
 
     public void analisarBaseComIA() {
-        LoteBalanceado lote = obterLotePendenteBalanceado();
-        log.info("[IA] Lote balanceado: {} despesas + {} emendas (limite={})",
-                lote.despesas().size(), lote.emendas().size(), lote.limite());
+        List<Despesa> despesasPendentes = repository.findPendentesDeAuditoria();
+        List<Emenda> emendasPendentes = emendaRepository.findPendentesDeAuditoria();
 
-        if (lote.limite() == 0) {
-            log.warn("[IA] Nada a analisar — é necessário ter despesas E emendas pendentes.");
-            return;
-        }
+        int limite = Math.min(loteMaximoAuditoria, Math.min(despesasPendentes.size(), emendasPendentes.size()));
+        log.info("[IA] Iniciando processamento de {} pares pendentes.", limite);
 
-        for (int i = 0; i < lote.limite(); i++) {
-            Despesa d = lote.despesas().get(i);
-            Emenda e = lote.emendas().get(i);
+        for (int i = 0; i < limite; i++) {
+            Despesa d = despesasPendentes.get(i);
+            Emenda e = emendasPendentes.get(i);
             try {
-                analisarDespesaComIA(d);
-                analisarEmendaComIA(e);
+                String promptD = String.format("[DESPESA] Fav: %s | Val: %s | Cat: %s | Empenho: %s",
+                        d.getNomeFavorecido(), d.getValorPago(), d.getCategoria(), d.getDocumentoOrigem());
+                d.setVereditoIA(auditorIA.analisar(promptD));
+                d.setScoreRisco(extrairScore(d.getVereditoIA()));
+                repository.save(d);
+
+                String promptE = String.format("[EMENDA] Autor: %s | Tipo: %s | Val: %s | Loc: %s",
+                        e.getAutor(), e.getTipoEmenda(), e.getValorPago(), e.getLocalidade());
+                e.setVereditoIA(auditorIA.analisar(promptE));
+                e.setScoreRisco(extrairScore(e.getVereditoIA()));
+                emendaRepository.save(e);
                 Thread.sleep(5000);
             } catch (Exception ex) {
-                log.error("[IA] Falha no par índice {}: {}", i, ex.getMessage());
+                log.error("[IA] Erro ao analisar: {}", ex.getMessage());
             }
         }
-        log.info("[IA] Análise balanceada concluída ({} pares processados).", lote.limite());
     }
-
-    private void analisarDespesaComIA(Despesa d) {
-        String prompt = String.format(
-                "[DESPESA] Fav: %s | Val: %s | Cat: %s | Empenho: %s",
-                d.getNomeFavorecido(), d.getValorPago(), d.getCategoria(), d.getDocumentoOrigem());
-        String veredito = auditorIA.analisar(prompt);
-        d.setVereditoIA(veredito);
-        d.setScoreRisco(extrairScore(veredito));
-        repository.save(d);
-    }
-
-    private void analisarEmendaComIA(Emenda e) {
-        String prompt = String.format(
-                "[EMENDA] Autor: %s | Tipo: %s | Valor: %s | Localidade: %s | Código: %s",
-                e.getAutor(), e.getTipoEmenda(), e.getValorPago(), e.getLocalidade(), e.getCodigoEmenda());
-        String veredito = auditorIA.analisar(prompt);
-        e.setVereditoIA(veredito);
-        e.setScoreRisco(extrairScore(veredito));
-        emendaRepository.save(e);
-    }
-
-    // =====================================================
-    // 6. DASHBOARD
-    // =====================================================
 
     public Map<String, Object> obterEstatisticasDashboard() {
         List<Despesa> todas = repository.findAll();
         List<Emenda> emendas = emendaRepository.findAll();
-        LoteBalanceado lote = obterLotePendenteBalanceado();
 
         Map<String, Object> s = new HashMap<>();
         s.put("total_registros", todas.size());
@@ -277,35 +234,41 @@ public class AuditoriaService {
                 todas.stream().filter(d -> d.getScoreRisco() != null && d.getScoreRisco() >= 80),
                 emendas.stream().filter(e -> e.getScoreRisco() != null && e.getScoreRisco() >= 80)
         ).count());
-        s.put("pendentes_ia_despesas", repository.findPendentesDeAuditoria().size());
-        s.put("pendentes_ia_emendas", emendaRepository.findPendentesDeAuditoria().size());
-        s.put("lote_balanceado", lote.limite());
+        s.put("pendentes_ia_despesas", todas.stream().filter(d -> d.getVereditoIA() == null).count());
+        s.put("pendentes_ia_emendas", emendas.stream().filter(e -> e.getVereditoIA() == null).count());
         s.put("lote_maximo_configurado", loteMaximoAuditoria);
+
         return s;
-    }
-
-    // =====================================================
-    // UTILITÁRIOS
-    // =====================================================
-
-    private double converterValor(String valor) {
-        if (valor == null || valor.isBlank()) return 0.0;
-        try {
-            return Double.parseDouble(
-                    valor.replace("R$", "").replace(".", "").replace(",", ".").trim());
-        } catch (Exception e) {
-            return 0.0;
-        }
     }
 
     private Integer extrairScore(String v) {
         if (v == null) return 50;
         String u = v.toUpperCase();
         if (u.contains("CRÍTICO") || u.contains("CRITICO")) return 95;
-        if (u.contains("ALTO RISCO"))                        return 85;
-        if (u.contains("SUSPEITO"))                          return 60;
+        if (u.contains("ALTO RISCO")) return 85;
+        if (u.contains("SUSPEITO")) return 60;
         if (u.contains("ATENÇÃO") || u.contains("ATENCAO")) return 40;
-        if (u.contains("REGULAR"))                           return 15;
+        if (u.contains("REGULAR")) return 15;
         return 50;
+    }
+
+    private String limparCnpj(String documentoSujo) {
+        if (documentoSujo == null || documentoSujo.isBlank()) return null;
+        String apenasNumeros = documentoSujo.replaceAll("[^0-9]", "");
+        return apenasNumeros.isEmpty() ? null : apenasNumeros;
+    }
+
+    private double converterValor(String valor) {
+        if (valor == null || valor.isBlank()) return 0.0;
+        try {
+            return Double.parseDouble(valor.replaceAll("[^\\d,]", "").replace(",", "."));
+        } catch (Exception e) { return 0.0; }
+    }
+
+    @Transactional
+    public void resetarCruzamentos() {
+        repository.resetarCruzamentos();
+        emendaRepository.resetarVereditos();
+        log.info("[Auditoria] Base resetada para nova auditoria.");
     }
 }

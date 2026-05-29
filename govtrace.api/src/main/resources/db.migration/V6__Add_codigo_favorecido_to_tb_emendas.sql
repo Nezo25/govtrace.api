@@ -1,0 +1,1 @@
+ALTER TABLE tb_emendas ADD COLUMN codigo_favorecido VARCHAR(50);

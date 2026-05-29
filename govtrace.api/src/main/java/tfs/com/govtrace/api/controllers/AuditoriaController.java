@@ -5,7 +5,6 @@ import com.fasterxml.jackson.dataformat.csv.CsvMapper;
 import com.fasterxml.jackson.dataformat.csv.CsvSchema;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
@@ -25,7 +24,6 @@ import java.util.concurrent.CompletableFuture;
 
 @RestController
 @RequestMapping("/api/auditoria")
-@RequiredArgsConstructor
 @CrossOrigin(origins = "*")
 public class AuditoriaController {
 
@@ -34,9 +32,13 @@ public class AuditoriaController {
     private final TransporteRepository transporteRepository;
     private final AuditoriaService auditoriaService;
 
-    // =====================================================
-    // 1. ENDPOINTS DE CARGA E INGESTÃO DE DADOS
-    // =====================================================
+    public AuditoriaController(EmendaRepository emendaRepository, DespesaRepository despesaRepository,
+                               TransporteRepository transporteRepository, AuditoriaService auditoriaService) {
+        this.emendaRepository = emendaRepository;
+        this.despesaRepository = despesaRepository;
+        this.transporteRepository = transporteRepository;
+        this.auditoriaService = auditoriaService;
+    }
 
     @PostMapping("/carga-despesas")
     public ResponseEntity<String> carregarDespesas(
@@ -71,25 +73,17 @@ public class AuditoriaController {
         }
     }
 
-    // =====================================================
-    // 2. ENDPOINTS DE PROCESSAMENTO E CRITICIDADE
-    // =====================================================
-
     @PostMapping("/cruzar-emendas")
     public ResponseEntity<String> dispararCruzamento() {
-        CompletableFuture.runAsync(auditoriaService::realizarCruzamentoEmendas);
+        CompletableFuture.runAsync(() -> auditoriaService.realizarCruzamentoEmendas());
         return ResponseEntity.accepted().body("Algoritmo de batimento de nexo causal iniciado em segundo plano.");
     }
 
     @PostMapping("/disparar-analise")
     public ResponseEntity<String> dispararAnalise() {
-        CompletableFuture.runAsync(auditoriaService::analisarBaseComIA);
+        CompletableFuture.runAsync(() -> auditoriaService.analisarBaseComIA());
         return ResponseEntity.accepted().body("Auditoria complementar via IA disparada em segundo plano.");
     }
-
-    // =====================================================
-    // 3. ENDPOINTS DE LEITURA (DASHBOARD E CONSULTAS)
-    // =====================================================
 
     @GetMapping("/dashboard")
     public ResponseEntity<Map<String, Object>> getDashboard() {
@@ -110,10 +104,6 @@ public class AuditoriaController {
     public ResponseEntity<List<Despesa>> getCasosCriticos(@RequestParam(defaultValue = "80") int threshold) {
         return ResponseEntity.ok(despesaRepository.findCasosCriticos(threshold));
     }
-
-    // =====================================================
-    // 4. UTILITÁRIOS (RESET E EXPORTAÇÃO)
-    // =====================================================
 
     @DeleteMapping("/limpar")
     @Transactional
@@ -147,5 +137,11 @@ public class AuditoriaController {
                     d.getDocumentoOrigem(), nomeMascarado, d.getValorPago(),
                     cat, d.getScoreRisco() != null ? d.getScoreRisco() : "0", veredito));
         });
+    }
+
+    @DeleteMapping("/resetar-cruzamentos")
+    public ResponseEntity<String> resetarCruzamentos() {
+        auditoriaService.resetarCruzamentos();
+        return ResponseEntity.ok("Todos os vínculos de auditoria foram removidos. A base está pronta para novo processamento.");
     }
 }
