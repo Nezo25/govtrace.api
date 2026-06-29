@@ -112,14 +112,26 @@ public class McpBrasilClient {
         ensureSession();
         ObjectNode req = buildRpc(idCounter.getAndIncrement(), method, params);
 
-        ResponseEntity<String> resp = restTemplate.postForEntity(mcpUrl,
-                new HttpEntity<>(mapper.writeValueAsString(req), baseHeaders(sessionId)), String.class);
+        ResponseEntity<String> resp = null;
+        JsonNode result = mapper.createObjectNode();
+        boolean tryReconect = false;
 
-        JsonNode result = parseSseOrJson(resp.getBody());
+        try {
+            resp = restTemplate.postForEntity(mcpUrl,
+                    new HttpEntity<>(mapper.writeValueAsString(req), baseHeaders(sessionId)), String.class);
+            result = parseSseOrJson(resp.getBody());
+        } catch (org.springframework.web.client.HttpStatusCodeException ex) {
+            String errorBody = ex.getResponseBodyAsString();
+            if (errorBody.contains("session") || ex.getStatusCode().value() == 404 || ex.getStatusCode().value() == 400) {
+                tryReconect = true;
+            } else {
+                throw new RuntimeException("MCP Error " + ex.getStatusCode() + ": " + errorBody);
+            }
+        }
 
-        if (result.path("error").path("code").asInt(0) == -32600
+        if (tryReconect || result.path("error").path("code").asInt(0) == -32600
                 || result.path("error").path("message").asText("").contains("session")) {
-            log.warn("[MCP] Sessão expirada. Reconectando...");
+            log.warn("[MCP] Sessão expirada ou não encontrada. Reconectando...");
             resetSession();
             ensureSession();
             req = buildRpc(idCounter.getAndIncrement(), method, params);

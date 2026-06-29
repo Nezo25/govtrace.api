@@ -46,6 +46,10 @@ public class Despesa {
     @JoinColumn(name = "emenda_id")
     private Emenda emenda;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "receita_id")
+    private Receita receita;
+
     @Column(name = "veredito_ia", columnDefinition = "TEXT")
     private String vereditoIA;
 
@@ -92,6 +96,9 @@ public class Despesa {
 
     public Emenda getEmenda() { return emenda; }
     public void setEmenda(Emenda emenda) { this.emenda = emenda; }
+
+    public Receita getReceita() { return receita; }
+    public void setReceita(Receita receita) { this.receita = receita; }
 
     public String getVereditoIA() { return vereditoIA; }
     public void setVereditoIA(String vereditoIA) { this.vereditoIA = vereditoIA; }

@@ -12,6 +12,8 @@ import tfs.com.govtrace.api.repositories.EmendaRepository;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.annotation.KafkaListener;
 
 @Service
 public class EmendaService {
@@ -22,6 +24,7 @@ public class EmendaService {
     private final EmendaRepository emendaRepository;
     private final DespesaRepository despesaRepository;
     private final TransactionTemplate transactionTemplate;
+    private final KafkaTemplate<String, String> kafkaTemplate;
 
     @Value("${govtrace.emendas.limite-carga:10000}")
     private int limiteCargaEmendas;
@@ -33,21 +36,46 @@ public class EmendaService {
     private int codigoIbgePadrao;
 
     public EmendaService(McpBrasilClient mcpClient, EmendaRepository emendaRepository,
-                         DespesaRepository despesaRepository, TransactionTemplate transactionTemplate) {
+                         DespesaRepository despesaRepository, TransactionTemplate transactionTemplate,
+                         KafkaTemplate<String, String> kafkaTemplate) {
         this.mcpClient = mcpClient;
         this.emendaRepository = emendaRepository;
         this.despesaRepository = despesaRepository;
         this.transactionTemplate = transactionTemplate;
+        this.kafkaTemplate = kafkaTemplate;
     }
 
     public void carregarEmendasMunicipio(String nomeMunicipio, int ano) {
-        carregarEmendasMunicipio(nomeMunicipio, ano, "ESTADO");
+        carregarEmendasMunicipio(nomeMunicipio, ano, "MUNICIPIO");
     }
 
     public void carregarEmendasMunicipio(String nomeMunicipio, int ano, String escopo) {
         String escopoEfetivo = (escopo != null && !escopo.isBlank()) ? escopo.toUpperCase() : "ESTADO";
         log.info("[Emendas] Iniciando carga massiva | {} | {} | Escopo: {}", nomeMunicipio, ano, escopoEfetivo);
         executarCarga(nomeMunicipio, ano, escopoEfetivo);
+    }
+
+    public void solicitarCargaEmendas(String municipio, int anoInicio, int anoFim) {
+        mcpClient.resetSession();
+        int total = 0;
+        for (int ano = anoInicio; ano <= anoFim; ano++) {
+            kafkaTemplate.send("fila-carga-emendas", String.format("%s;%d", municipio, ano));
+            total++;
+        }
+        log.info("[Kafka] {} mensagens enfileiradas para carga de emendas.", total);
+    }
+
+    @KafkaListener(topics = "fila-carga-emendas", groupId = "govtrace-carga-v3")
+    public void processarMensagemCargaEmendas(String payload) {
+        String[] dados = payload.split(";");
+        if (dados.length < 2) return;
+        String municipio = dados[0];
+        int ano = Integer.parseInt(dados[1]);
+        try {
+            executarCarga(municipio, ano, "MUNICIPIO");
+        } catch (Exception e) {
+            log.error("[Kafka] Erro na carga de emendas: {}", e.getMessage());
+        }
     }
 
     private void executarCarga(String nomeMunicipio, int ano, String escopo) {
@@ -78,78 +106,240 @@ public class EmendaService {
         }
     }
 
-    // =====================================================
-    // PARSER CORRIGIDO - LÊ EXATAMENTE AS 7 COLUNAS DO PYTHON
-    // =====================================================
+    /**
+     * Fatiamento da tabela Markdown retornada pelo MCP (7 colunas: Número … Pago).
+     * Índices úteis após split("|"): [1]..[7] quando [0] é vazio por causa do "|" inicial.
+     */
     private int parsearEmendasCGU(String texto, String municipioAlvo, int ano, String escopo) {
-        if (texto == null || texto.isBlank()) return 0;
+        if (texto == null || texto.isBlank()) {
+            log.warn("[Parser][Emendas] Texto MCP vazio ou nulo recebido para processamento.");
+            return 0;
+        }
 
         List<Emenda> emendasLote = new ArrayList<>();
         String[] linhas = texto.split("\\r?\\n");
 
-        for (String linha : linhas) {
-            // Se a linha não começa com "|" ou é o cabeçalho (que contém --- ou a palavra Número), ignora.
-            if (linha.trim().isEmpty() || !linha.trim().startsWith("|") || linha.contains("---") || linha.contains("Número")) {
+        int linhaNum = 0;
+        int ignoradas = 0;
+        int colunasInsuficientes = 0;
+        int duplicadas = 0;
+        int errosParse = 0;
+
+        log.info("[Parser][Emendas] Iniciando processamento de {} linhas...", linhas.length);
+
+        for (String linhaBruta : linhas) {
+            linhaNum++;
+            String linha = linhaBruta.trim();
+
+            if (linha.isEmpty() || !linha.startsWith("|") || linha.contains("---")) {
+                ignoradas++;
                 continue;
             }
 
-            // Quebra nas barras verticais do Markdown
-            // O split("\\|") em uma string como "| A | B | C |" gera um array onde o índice 0 é vazio.
-            // Os dados úteis começam no índice 1.
-            String[] cols = linha.split("\\|");
+            String linhaUpper = linha.toUpperCase(Locale.ROOT);
+            if (linhaUpper.contains("NÚMERO") || linhaUpper.contains("NUMERO")
+                    || linhaUpper.contains("COD. EMENDA") || linhaUpper.contains("COD EMENDA")) {
+                ignoradas++;
+                continue;
+            }
 
-            // Como a tabela tem 7 colunas visuais, o array resultante do split terá pelo menos 8 posições.
-            if (cols.length >= 8) {
-                try {
-                    String codigo = cols[1].trim();
-                    if (codigo.isEmpty() || codigo.equals("—")) {
-                        // Gera um UUID único para caso o Python não mande o número (para não bater duplicado com nulo)
-                        codigo = "CGU-" + ano + "-" + UUID.randomUUID().toString().substring(0,8);
-                    }
+            try {
+                // ISO/OWASP: Sanitização da linha e extração baseada em Streams para evitar offsets erráticos
+                String linhaLimpa = linha;
+                if (linhaLimpa.startsWith("|")) linhaLimpa = linhaLimpa.substring(1);
+                if (linhaLimpa.endsWith("|")) linhaLimpa = linhaLimpa.substring(0, linhaLimpa.length() - 1);
 
-                    if (emendaRepository.existsByCodigoEmenda(codigo)) continue;
+                List<String> cols = Arrays.stream(linhaLimpa.split("\\|", -1))
+                        .map(String::trim)
+                        .toList();
 
-                    Emenda emenda = new Emenda();
-                    emenda.setCodigoEmenda(codigo);
-                    emenda.setAutor(cols[2].trim().toUpperCase());
-                    emenda.setNomeAutor(cols[2].trim().toUpperCase());
-                    emenda.setTipoEmenda(cols[3].trim());
+                boolean formatoEstendido = cols.size() > 9;
+                
+                int idxCodigoEmenda = 0;
+                int idxNumero = formatoEstendido ? 1 : 0;
+                int idxAutor = formatoEstendido ? 2 : 1;
+                int idxNatureza = formatoEstendido ? 3 : 2;
+                int idxTipo = formatoEstendido ? 4 : 3;
+                int idxLocalidade = formatoEstendido ? 5 : 4;
+                int idxCnpj = formatoEstendido ? 6 : 5;
+                int idxFuncao = formatoEstendido ? 7 : -1;
+                int idxSubfuncao = formatoEstendido ? 8 : -1;
+                int idxEmpenhado = formatoEstendido ? 9 : 6;
+                int idxPago = formatoEstendido ? 10 : 7;
 
-                    String localidade = cols[4].trim().toUpperCase();
-                    emenda.setLocalidade(localidade);
-
-                    // Coluna CNPJ Favorecido (O 5º elemento útil, logo índice 5)
-                    String cnpjSujo = cols[5].trim();
-                    String cnpjLimpo = cnpjSujo.replaceAll("[^0-9]", "");
-                    // Se não encontrou número, salva nulo (ou a String da prefeitura por fallback se for o caso)
-                    if(cnpjLimpo.isEmpty() && localidade.contains("BRAGANC")) {
-                        cnpjLimpo = "46352746000165";
-                    }
-                    emenda.setCodigoFavorecido(cnpjLimpo.isEmpty() ? null : cnpjLimpo);
-
-                    // Valor Empenhado (Índice 6) e Valor Pago (Índice 7)
-                    String valEmpenhadoStr = cols[6].trim().replaceAll("[^\\d,]", "").replace(",", ".");
-                    String valPagoStr = cols[7].trim().replaceAll("[^\\d,]", "").replace(",", ".");
-
-                    emenda.setValorEmpenhado(valEmpenhadoStr.isEmpty() ? "0" : valEmpenhadoStr);
-                    emenda.setValorPago(valPagoStr.isEmpty() ? "0" : valPagoStr);
-
-                    emenda.setFuncao(localidade.contains("BRAGANC") ? "BRAGANCA_PAULISTA" : "INVESTIMENTO_SP");
-                    emenda.setAno(ano);
-                    emenda.setFonteDados("CGU-" + escopo);
-                    emenda.setFavorecidoInidoneo(false);
-
-                    emendasLote.add(emenda);
-                } catch (Exception ex) {
-                    log.warn("[Parser] Ignorando linha mal formatada: {} | Erro: {}", linha, ex.getMessage());
+                if (cols.size() <= idxPago) {
+                    colunasInsuficientes++;
+                    log.warn("[Parser][Emendas] L{}: Colunas insuficientes (encontradas {}, necessárias {}).", linhaNum, cols.size(), idxPago + 1);
+                    continue;
                 }
+
+                String codigo = cols.get(idxCodigoEmenda);
+                if (!formatoEstendido && isVazioOuTraco(codigo)) {
+                    codigo = gerarCodigoFallback(ano);
+                } else if (formatoEstendido && (isVazioOuTraco(codigo) || codigo.startsWith("DOC-"))) {
+                    String numeroTmp = cols.get(idxNumero);
+                    codigo = !isVazioOuTraco(numeroTmp) ? "CGU-" + ano + "-" + numeroTmp.replaceAll("[^A-Za-z0-9]", "") : gerarCodigoFallback(ano);
+                }
+
+                if (emendaRepository.existsByCodigoEmenda(codigo)) {
+                    duplicadas++;
+                    continue;
+                }
+
+                String autor = sanitizarTexto(cols.get(idxAutor)).toUpperCase(Locale.ROOT);
+                String natureza = sanitizarTexto(cols.get(idxNatureza));
+                String tipo = sanitizarTexto(cols.get(idxTipo));
+                String localidade = sanitizarTexto(cols.get(idxLocalidade)).toUpperCase(Locale.ROOT);
+
+                String cnpjBruto = cols.get(idxCnpj);
+                String cnpjLimpo = sanitizarDocumento(cnpjBruto);
+                
+                if (cnpjLimpo.isEmpty() && localidadeNormalizada(localidade).contains("BRAGANC")) {
+                    cnpjLimpo = "46352746000165";
+                }
+
+                String valEmpenhado = normalizarValorMonetarioSeguro(cols.get(idxEmpenhado));
+                String valPago = normalizarValorMonetarioSeguro(cols.get(idxPago));
+                
+                String funcaoApi = idxFuncao >= 0 ? sanitizarTexto(cols.get(idxFuncao)) : "";
+                String subfuncaoApi = idxSubfuncao >= 0 ? sanitizarTexto(cols.get(idxSubfuncao)) : "";
+
+                Emenda emenda = new Emenda();
+                emenda.setCodigoEmenda(codigo);
+                emenda.setAutor(autor);
+                emenda.setNomeAutor(autor);
+                emenda.setNaturezaDespesa(natureza);
+                emenda.setTipoEmenda(tipo);
+                emenda.setLocalidade(localidade);
+                emenda.setCodigoFavorecido(cnpjLimpo.isEmpty() ? null : cnpjLimpo);
+                emenda.setValorEmpenhado(valEmpenhado);
+                emenda.setValorPago(valPago);
+                
+                if (!funcaoApi.isEmpty() && !"—".equals(funcaoApi)) {
+                    emenda.setFuncao(funcaoApi);
+                } else {
+                    emenda.setFuncao(localidadeNormalizada(localidade).contains("BRAGANC")
+                            ? "BRAGANCA_PAULISTA" : "INVESTIMENTO_SP");
+                }
+                
+                if (!subfuncaoApi.isEmpty() && !"—".equals(subfuncaoApi)) {
+                    emenda.setSubfuncao(subfuncaoApi);
+                }
+                
+                emenda.setAno(ano);
+                emenda.setFonteDados(formatoEstendido ? "CGU-CNPJ-" + escopo : "CGU-" + escopo);
+                emenda.setFavorecidoInidoneo(false);
+
+                emendasLote.add(emenda);
+
+            } catch (Exception ex) {
+                errosParse++;
+                // ITIL/LGPD: Log estruturado mascarando dados sensíveis sem derrubar a thread
+                log.warn("[Parser][Emendas] Falha na L{}: {}. Dados: {}", 
+                         linhaNum, ex.getMessage(), mascararLGPD(resumirLinha(linha)));
             }
         }
 
         if (!emendasLote.isEmpty()) {
             emendaRepository.saveAll(emendasLote);
+            // ITIL: Info level para consolidação de negócio
+            log.info("[Parser][Emendas] Lote processado. {} emendas salvas.", emendasLote.size());
         }
+
+        log.info("[Parser][Emendas] Resumo: {} linhas | {} salvas | {} ignoradas | {} s/ colunas | {} duplicadas | {} erros",
+                linhas.length, emendasLote.size(), ignoradas, colunasInsuficientes, duplicadas, errosParse);
+
         return emendasLote.size();
+    }
+
+    // --- DIRETRIZES: ISO/OWASP E LGPD ---
+
+    private String gerarCodigoFallback(int ano) {
+        return "CGU-" + ano + "-" + UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    private String sanitizarTexto(String entrada) {
+        if (entrada == null) return "";
+        // ISO/OWASP: Previne XSS e corrupção removendo tags HTML e caracteres de controle
+        return entrada.trim().replaceAll("<[^>]*>", "").replaceAll("[\\x00-\\x1F]", "");
+    }
+
+    private String sanitizarDocumento(String doc) {
+        if (doc == null) return "";
+        return doc.replaceAll("[^0-9]", "");
+    }
+
+    private String normalizarValorMonetarioSeguro(String bruto) {
+        if (bruto == null || bruto.isBlank()) return "0";
+        try {
+            String numerico = bruto.replaceAll("[^\\d,]", "").replace(",", ".");
+            if (numerico.isEmpty()) return "0";
+            Double.parseDouble(numerico); // Validação de cast fail-fast
+            return numerico;
+        } catch (NumberFormatException e) {
+            log.warn("[Segurança] Cast monetário falhou para '{}'. Assumindo 0.", mascararLGPD(bruto));
+            return "0";
+        }
+    }
+
+    private String mascararLGPD(String dadoSensivel) {
+        if (dadoSensivel == null) return "null";
+        // Mascara CPFs/CNPJs para evitar vazamento de PII em logs
+        return dadoSensivel.replaceAll("\\b(\\d{3})\\.(\\d{3})\\.(\\d{3})-(\\d{2})\\b", "***.$2.$3-**")
+                           .replaceAll("\\b(\\d{2})\\.(\\d{3})\\.(\\d{3})/(\\d{4})-(\\d{2})\\b", "**.$2.$3/$4-**");
+    }
+
+    private static String col(String[] cols, int index) {
+        if (index < 0 || index >= cols.length) {
+            throw new IndexOutOfBoundsException(
+                    "índice " + index + " fora do array (length=" + cols.length + ")");
+        }
+        return cols[index].trim();
+    }
+
+    private static boolean isVazioOuTraco(String valor) {
+        if (valor == null || valor.isBlank()) {
+            return true;
+        }
+        String t = valor.trim();
+        return "-".equals(t)
+                || "—".equals(t)
+                || "–".equals(t)
+                || "‑".equals(t)
+                || "N/A".equalsIgnoreCase(t)
+                || "NA".equalsIgnoreCase(t);
+    }
+
+    private static String normalizarValorMonetario(String bruto) {
+        String numerico = bruto.replaceAll("[^\\d,]", "").replace(",", ".");
+        return numerico.isEmpty() ? "0" : numerico;
+    }
+
+    private static String localidadeNormalizada(String localidade) {
+        if (localidade == null) {
+            return "";
+        }
+        return localidade
+                .toUpperCase(Locale.ROOT)
+                .replace("Á", "A")
+                .replace("À", "A")
+                .replace("Ã", "A")
+                .replace("Â", "A")
+                .replace("É", "E")
+                .replace("Ê", "E")
+                .replace("Í", "I")
+                .replace("Ó", "O")
+                .replace("Ô", "O")
+                .replace("Õ", "O")
+                .replace("Ú", "U")
+                .replace("Ç", "C");
+    }
+
+    private static String resumirLinha(String linha) {
+        if (linha == null) {
+            return "";
+        }
+        return linha.length() <= 160 ? linha : linha.substring(0, 157) + "...";
     }
 
     public void diagnosticarTool() {

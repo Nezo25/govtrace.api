@@ -27,11 +27,11 @@ public class EmendaController {
     public ResponseEntity<String> carregarCGU(
             @RequestParam(defaultValue = "braganca-paulista") String municipio,
             @RequestParam(defaultValue = "2024") int ano,
-            @RequestParam(defaultValue = "ESTADO") String escopo) {
+            @RequestParam(defaultValue = "MUNICIPIO") String escopo) {
 
         CompletableFuture.runAsync(() -> emendaService.carregarEmendasMunicipio(municipio, ano, escopo));
         return ResponseEntity.accepted().body(String.format(
-                "Carga CGU: %s / %d | escopo=%s (ESTADO=SP+Bragança até 1200; MUNICIPIO=só Bragança).",
+                "Carga CGU: %s / %d | escopo=%s (MUNICIPIO=varre API e filtra só Bragança; ESTADO=SP até limite).",
                 municipio, ano, escopo.toUpperCase()));
     }
 

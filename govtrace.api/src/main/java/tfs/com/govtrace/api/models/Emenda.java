@@ -44,6 +44,10 @@ public class Emenda {
     @JsonProperty("localidadeDoGasto")
     private String localidade;
 
+    @Column(name = "natureza_despesa")
+    @JsonProperty("naturezaDespesa")
+    private String naturezaDespesa;
+
     // === NOVA COLUNA PARA O JOIN COM O TCE-SP ===
     @Column(name = "codigo_favorecido", length = 50)
     @JsonProperty("codigoFavorecido")
@@ -111,6 +115,9 @@ public class Emenda {
 
     public String getLocalidade() { return localidade; }
     public void setLocalidade(String localidade) { this.localidade = localidade; }
+
+    public String getNaturezaDespesa() { return naturezaDespesa; }
+    public void setNaturezaDespesa(String naturezaDespesa) { this.naturezaDespesa = naturezaDespesa; }
 
     public String getCodigoFavorecido() { return codigoFavorecido; }
     public void setCodigoFavorecido(String codigoFavorecido) { this.codigoFavorecido = codigoFavorecido; }

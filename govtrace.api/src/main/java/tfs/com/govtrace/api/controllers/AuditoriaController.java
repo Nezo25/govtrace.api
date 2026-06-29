@@ -15,6 +15,7 @@ import tfs.com.govtrace.api.repositories.DespesaRepository;
 import tfs.com.govtrace.api.repositories.EmendaRepository;
 import tfs.com.govtrace.api.repositories.TransporteRepository;
 import tfs.com.govtrace.api.services.AuditoriaService;
+import tfs.com.govtrace.api.services.EmendaService;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -31,13 +32,16 @@ public class AuditoriaController {
     private final DespesaRepository despesaRepository;
     private final TransporteRepository transporteRepository;
     private final AuditoriaService auditoriaService;
+    private final EmendaService emendaService;
 
     public AuditoriaController(EmendaRepository emendaRepository, DespesaRepository despesaRepository,
-                               TransporteRepository transporteRepository, AuditoriaService auditoriaService) {
+                               TransporteRepository transporteRepository, AuditoriaService auditoriaService,
+                               EmendaService emendaService) {
         this.emendaRepository = emendaRepository;
         this.despesaRepository = despesaRepository;
         this.transporteRepository = transporteRepository;
         this.auditoriaService = auditoriaService;
+        this.emendaService = emendaService;
     }
 
     @PostMapping("/carga-despesas")
@@ -54,6 +58,22 @@ public class AuditoriaController {
 
         auditoriaService.solicitarCarga(cidade, anoInicio, fim);
         return ResponseEntity.accepted().body("Carga de despesas municipais enfileirada com sucesso via Kafka.");
+    }
+
+    @PostMapping("/carga-emendas")
+    public ResponseEntity<String> carregarEmendas(
+            @RequestParam(defaultValue = "braganca-paulista") String cidade,
+            @RequestParam(defaultValue = "2024") int anoInicio,
+            @RequestParam(required = false) Integer anoFim) {
+
+        int fim = (anoFim != null) ? anoFim : anoInicio;
+
+        if (fim < anoInicio) {
+            return ResponseEntity.badRequest().body("anoFim não pode ser menor que anoInicio.");
+        }
+
+        emendaService.solicitarCargaEmendas(cidade, anoInicio, fim);
+        return ResponseEntity.accepted().body("Carga de emendas enfileirada com sucesso via Kafka.");
     }
 
     @PostMapping("/upload-transporte")
@@ -81,8 +101,12 @@ public class AuditoriaController {
 
     @PostMapping("/disparar-analise")
     public ResponseEntity<String> dispararAnalise() {
+        long pendentes = despesaRepository.findByMetodoCruzamentoIsNotNullAndVereditoIAIsNull().size();
+        if (pendentes == 0) {
+            return ResponseEntity.ok("Nenhum registro cruzado pendente de análise por IA.");
+        }
         CompletableFuture.runAsync(() -> auditoriaService.analisarBaseComIA());
-        return ResponseEntity.accepted().body("Auditoria complementar via IA disparada em segundo plano.");
+        return ResponseEntity.accepted().body("Processamento de IA iniciado para " + pendentes + " registros pendentes.");
     }
 
     @GetMapping("/dashboard")
@@ -97,7 +121,7 @@ public class AuditoriaController {
 
     @GetMapping("/pendentes")
     public ResponseEntity<List<Despesa>> getPendentes() {
-        return ResponseEntity.ok(despesaRepository.findPendentesDeAuditoria());
+        return ResponseEntity.ok(despesaRepository.findByMetodoCruzamentoIsNotNullAndVereditoIAIsNull());
     }
 
     @GetMapping("/casos-criticos")
